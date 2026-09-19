@@ -8,9 +8,12 @@ SIM_URL="http://localhost:8080"
 
 die() { echo "Error: $*" >&2; exit 1; }
 
-for tool in docker curl adb python3; do
+for tool in docker curl adb python3 pgrep; do
   command -v "$tool" >/dev/null || die "$tool is required"
 done
+if pgrep -f '[p]ython.*mission.py' >/dev/null; then
+  die "mission.py is already running; stop it before starting another"
+fi
 [[ -f "${SIM_DIR}/docker-compose.yml" ]] || die "arctic-sim must be next to this repo"
 [[ -f "${SIM_DIR}/sim/gzweb/gz3d/src/gzxr.js" ]] || die "arctic-sim needs the WebXR viewer branch"
 [[ -f "${SIM_DIR}/.env" ]] || cp "${SIM_DIR}/.env.example" "${SIM_DIR}/.env"
