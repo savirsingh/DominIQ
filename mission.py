@@ -24,7 +24,7 @@ import numpy as np
 # Config
 # ---------------------------------------------------------------------------
 
-SIM_HOST = "10.99.7.1"
+SIM_HOST = os.environ.get("SIM_HOST", "10.99.7.1")
 
 ASSETS = {
     "quadcopter": {"udp": 14550, "guided_mode": 4,  "is_plane": False},
