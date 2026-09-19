@@ -3,6 +3,7 @@ __MACOSX/
 *.pdf
 __pycache__/
 *.pyc
+.venv/
 htn-2026-main(1)/
 .playwright-mcp/
 patrol_orig.py

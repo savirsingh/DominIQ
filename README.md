@@ -30,6 +30,21 @@ Open http://10.99.7.1:8080 in Chrome — you should see the 3D sim.
 
 ## Usage
 
+### Local simulator and Quest
+
+With `arctic-sim` checked out beside this repo, Docker Desktop running, and a
+Quest connected by USB with debugging allowed, run:
+
+```bash
+./start-quest-mission.sh
+```
+
+The script builds and starts the local simulator, forwards its browser and
+camera ports to Quest, opens `http://localhost:8080` there, then runs the
+mission against the local simulator. Choose a vehicle for VR or **Tabletop map
+(AR)** for a passthrough terrain map with live asset pointers. Ctrl+C stops the
+mission and resets the local simulator.
+
 ### Check asset status
 
 ```bash
