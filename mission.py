@@ -21,8 +21,14 @@ import math
 import time
 import sys
 import os
+import json
 import cv2
 import numpy as np
+
+try:
+    import websocket as _ws_mod
+except ImportError:
+    _ws_mod = None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -67,6 +73,69 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 MODEL_CONF = 0.25
 DETECTION_INTERVAL = 1.5  # seconds between AI inference frames
 
+WS_URL = f"ws://{SIM_HOST}:8080"
+
+# EPSG:3413 site bounds for coordinate conversion
+SITE_BOUNDS = {
+    "xmin": -1505608.044159686, "ymin": -1271830.812646156,
+    "xmax": -1499139.421867714, "ymax": -1265362.190354184,
+}
+SITE_CX = (SITE_BOUNDS["xmin"] + SITE_BOUNDS["xmax"]) / 2
+SITE_CY = (SITE_BOUNDS["ymin"] + SITE_BOUNDS["ymax"]) / 2
+D2R = math.pi / 180
+R2D = 180 / math.pi
+PS_A = 6378137.0
+PS_E = 0.081819190842621
+PS_LAT_TS = 70 * D2R
+PS_LON0 = -45 * D2R
+
+# ---------------------------------------------------------------------------
+# Coordinate conversion (world coords ↔ lat/lon via polar stereographic)
+# ---------------------------------------------------------------------------
+
+def world_to_latlon(wx, wy):
+    x, y = SITE_CX + wx, SITE_CY + wy
+    tc = math.tan(math.pi / 4 - PS_LAT_TS / 2) / ((1 - PS_E * math.sin(PS_LAT_TS)) / (1 + PS_E * math.sin(PS_LAT_TS))) ** (PS_E / 2)
+    mc = math.cos(PS_LAT_TS) / math.sqrt(1 - PS_E ** 2 * math.sin(PS_LAT_TS) ** 2)
+    t = math.hypot(x, y) * tc / (PS_A * mc)
+    chi = math.pi / 2 - 2 * math.atan(t)
+    e2 = PS_E ** 2; e4 = e2 ** 2; e6 = e4 * e2; e8 = e4 ** 2
+    lat = chi + (e2/2+5*e4/24+e6/12+13*e8/360)*math.sin(2*chi) \
+        + (7*e4/48+29*e6/240+811*e8/11520)*math.sin(4*chi) \
+        + (7*e6/120+81*e8/1120)*math.sin(6*chi) \
+        + (4279*e8/161280)*math.sin(8*chi)
+    lon = PS_LON0 + math.atan2(x, -y)
+    return lat * R2D, ((lon * R2D + 540) % 360) - 180
+
+# ---------------------------------------------------------------------------
+# Vessel position tracker (reads gzweb WebSocket for ground-truth boat pose)
+# ---------------------------------------------------------------------------
+
+def run_vessel_tracker(state):
+    """Track the target vessel's real position via the gzweb WebSocket."""
+    if _ws_mod is None:
+        log("vessel", "websocket module not installed — vessel tracking disabled")
+        return
+    while not state.shutdown:
+        try:
+            ws = _ws_mod.create_connection(WS_URL, timeout=5)
+            ws.settimeout(0.5)
+            while not state.shutdown:
+                try:
+                    raw = ws.recv()
+                    d = json.loads(raw)
+                    if d.get("topic") == "~/pose/info" and d.get("msg", {}).get("name") == "target_vessel":
+                        pos = d["msg"]["position"]
+                        lat, lon = world_to_latlon(pos["x"], pos["y"])
+                        with state.lock:
+                            state.vessel_lat = lat
+                            state.vessel_lon = lon
+                except Exception:
+                    pass
+            ws.close()
+        except Exception:
+            time.sleep(3)
+
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
@@ -76,10 +145,12 @@ class SharedState:
         self.lock = threading.Lock()
         self.tower1_detected = False
         self.tower2_detected = False
-        self.tower_bearing = None  # estimated bearing from detecting tower
+        self.tower_bearing = None
         self.boat_found = False
         self.boat_lat = 0.0
         self.boat_lon = 0.0
+        self.vessel_lat = 0.0  # real vessel position from gzweb
+        self.vessel_lon = 0.0
         self.locked = False
         self.shutdown = False
         self.asset_positions = {}
@@ -218,7 +289,7 @@ class TowerWatcher:
 # MAVLink helpers
 # ---------------------------------------------------------------------------
 
-def connect(name):
+def connect(name, wait_ekf=False):
     info = ASSETS[name]
     addr = f"udpout:{SIM_HOST}:{info['udp']}"
     conn = mavutil.mavlink_connection(addr, source_system=255)
@@ -232,6 +303,18 @@ def connect(name):
     msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=5)
     if not msg:
         raise ConnectionError(f"No heartbeat from {name}")
+    if wait_ekf:
+        log(name, "waiting for EKF...")
+        start = time.time()
+        while time.time() - start < 40:
+            conn.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            m = conn.recv_match(blocking=True, timeout=1)
+            if m and m.get_type() == "EKF_STATUS_REPORT" and m.flags & 0x1F == 0x1F:
+                log(name, f"EKF ready ({time.time()-start:.0f}s)")
+                return conn
+        log(name, "EKF wait timed out, proceeding anyway")
     return conn
 
 
@@ -251,28 +334,58 @@ def set_mode(conn, mode_id):
         conn.target_system,
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
         mode_id)
-    time.sleep(1)
+    # Drain until we see the mode change or timeout
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+        if msg and msg.custom_mode == mode_id:
+            return
+        conn.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+    time.sleep(0.5)
 
 
 def arm(conn):
-    conn.mav.command_long_send(
-        conn.target_system, conn.target_component,
-        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-        0, 1, 0, 0, 0, 0, 0, 0)
-    msg = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
-    return msg and msg.result == 0
+    for attempt in range(5):
+        conn.mav.command_long_send(
+            conn.target_system, conn.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 1, 0, 0, 0, 0, 0, 0)
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            conn.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_GCS,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+            if msg and msg.base_mode & 128:
+                return True
+        time.sleep(1)
+    return False
 
 
-def takeoff_and_wait(conn, alt, state, timeout=40):
+def takeoff_and_wait(conn, alt, state, timeout=60):
     conn.mav.command_long_send(
         conn.target_system, conn.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
         0, 0, 0, 0, 0, 0, 0, alt)
     start = time.time()
+    retried = False
     while time.time() - start < timeout and not state.shutdown:
+        conn.mav.heartbeat_send(
+            mavutil.mavlink.MAV_TYPE_GCS,
+            mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
         gps = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
-        if gps and gps.relative_alt / 1e3 >= alt * 0.85:
-            return True
+        if gps:
+            cur_alt = gps.relative_alt / 1e3
+            if cur_alt >= alt * 0.85:
+                return True
+            if cur_alt < 1.0 and time.time() - start > 15 and not retried:
+                retried = True
+                conn.mav.command_long_send(
+                    conn.target_system, conn.target_component,
+                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                    0, 0, 0, 0, 0, 0, 0, alt)
         time.sleep(0.5)
     return False
 
@@ -329,8 +442,7 @@ def run_quadcopter(state, detector):
     info = ASSETS[name]
     try:
         log(name, "connecting...")
-        conn = connect(name)
-        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
+        conn = connect(name, wait_ekf=True)
 
         log(name, "setting GUIDED mode")
         set_mode(conn, info["guided_mode"])
@@ -344,6 +456,10 @@ def run_quadcopter(state, detector):
         log(name, f"taking off to {QUAD_PATROL_ALT}m")
         if not takeoff_and_wait(conn, QUAD_PATROL_ALT, state):
             log(name, "takeoff timed out, continuing anyway")
+        else:
+            log(name, "reached altitude")
+
+        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
 
         waypoints = generate_circle_waypoints(
             *SITE_CENTER, QUAD_PATROL_RADIUS_M, QUAD_PATROL_WAYPOINTS)
@@ -356,13 +472,17 @@ def run_quadcopter(state, detector):
 
         while not state.shutdown:
             if state.boat_found:
-                log(name, "boat found — hovering at current position")
+                log(name, "boat found — flying to vessel")
                 while state.boat_found and not state.shutdown:
+                    with state.lock:
+                        vlat, vlon = state.vessel_lat, state.vessel_lon
+                    if vlat != 0.0 and vlon != 0.0:
+                        send_goto(conn, vlat, vlon, QUAD_PATROL_ALT)
                     pos = get_position(conn)
                     if pos:
                         with state.lock:
                             state.asset_positions[name] = pos
-                    time.sleep(2)
+                    time.sleep(1.5)
                 continue
 
             # AI detection while patrolling
@@ -430,32 +550,25 @@ def run_fixed_wing(state, detector):
     info = ASSETS[name]
     try:
         log(name, "connecting...")
-        conn = connect(name)
-        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
+        conn = connect(name, wait_ekf=True)
 
-        log(name, "setting TAKEOFF mode")
+        log(name, "setting TAKEOFF mode and arming")
         set_mode(conn, 13)
-
+        if not arm(conn):
+            log(name, "ARM FAILED")
+            return
+        log(name, f"armed — sending takeoff to {PLANE_PATROL_ALT}m")
         conn.mav.command_long_send(
             conn.target_system, conn.target_component,
             mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
             0, 0, 0, 0, 0, 0, 0, PLANE_PATROL_ALT)
-        time.sleep(0.5)
 
-        log(name, "arming")
-        conn.mav.command_long_send(
-            conn.target_system, conn.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 0, 0, 0, 0, 0, 0)
-        ack = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
-        if not (ack and ack.result == 0):
-            log(name, f"ARM FAILED: {ack}")
-            return
-        time.sleep(1)
-
-        log(name, f"taking off to {PLANE_PATROL_ALT}m")
-        if not takeoff_and_wait(conn, PLANE_PATROL_ALT, state, timeout=60):
+        if not takeoff_and_wait(conn, PLANE_PATROL_ALT, state, timeout=80):
             log(name, "takeoff timed out, continuing anyway")
+        else:
+            log(name, "reached altitude")
+
+        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
 
         log(name, "switching to GUIDED mode for patrol")
         set_mode(conn, 15)
@@ -472,29 +585,20 @@ def run_fixed_wing(state, detector):
         while not state.shutdown:
             # --- Phase 3: boat found → lock on and follow ---
             if state.boat_found:
-                log(name, "BOAT FOUND — locking on")
+                log(name, "BOAT FOUND — locking on to vessel")
                 state.locked = True
                 while state.boat_found and not state.shutdown:
                     with state.lock:
-                        blat, blon = state.boat_lat, state.boat_lon
-                    if blat != 0.0 and blon != 0.0:
-                        send_goto(conn, blat, blon, PLANE_PATROL_ALT)
+                        vlat, vlon = state.vessel_lat, state.vessel_lon
+                    if vlat != 0.0 and vlon != 0.0:
+                        send_goto(conn, vlat, vlon, PLANE_PATROL_ALT)
+                        with state.lock:
+                            state.boat_lat = vlat
+                            state.boat_lon = vlon
                     pos = get_position(conn)
                     if pos:
                         with state.lock:
                             state.asset_positions[name] = pos
-
-                        # Keep updating boat position from AI
-                        if time.time() - last_detect > DETECTION_INTERVAL:
-                            frame = cam.latest()
-                            if frame is not None and detector.model is not None:
-                                dets = detector.detect(frame)
-                                if dets:
-                                    with state.lock:
-                                        state.boat_lat = pos[0]
-                                        state.boat_lon = pos[1]
-                                last_detect = time.time()
-
                     time.sleep(1.5)
                 continue
 
@@ -620,7 +724,7 @@ def run_tower(name, state):
                             state.tower1_detected = True
                         else:
                             state.tower2_detected = True
-                elif watcher.learning and watcher.looks % 30 == 0:
+                elif watcher.learning and watcher.looks % 100 == 0:
                     left = watcher.learn_time - (time.time() - watcher.started)
                     if left > 0:
                         log(name, f"learning background... {left:.0f}s left")
@@ -704,6 +808,8 @@ def status_printer(state):
             flags.append("tower-1:MOTION")
         if state.tower2_detected:
             flags.append("tower-2:MOTION")
+        if state.vessel_lat != 0:
+            flags.append(f"VESSEL({state.vessel_lat:.5f},{state.vessel_lon:.5f})")
         if state.boat_found:
             flags.append(f"BOAT({state.boat_lat:.5f},{state.boat_lon:.5f})")
         if state.locked:
@@ -735,6 +841,7 @@ def main():
     detector = BoatDetector(MODEL_PATH, conf=MODEL_CONF)
 
     threads = [
+        threading.Thread(target=run_vessel_tracker, args=(state,), name="vessel"),
         threading.Thread(target=run_quadcopter, args=(state, detector), name="quadcopter"),
         threading.Thread(target=run_fixed_wing, args=(state, detector), name="fixed-wing"),
         threading.Thread(target=run_tower, args=("tower-1", state), name="tower-1"),
