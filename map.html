@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Arctic SIM-8 — Tracker Map</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #0b1216; color: #dfe8ec; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
+  #top { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; background: #111a1f; border-bottom: 1px solid #23343b; }
+  #top h1 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: #8fa6ae; }
+  #status { color: #57d38c; font-size: 11px; }
+  #status.off { color: #ff9b8a; }
+  #wrap { display: flex; height: calc(100vh - 38px); overflow: hidden; }
+  canvas { flex: 1; min-width: 0; display: block; cursor: crosshair; }
+  #panel { width: 280px; min-width: 280px; padding: 12px; border-left: 1px solid #23343b; overflow-y: auto; font-size: 11px; }
+  .section { margin-bottom: 14px; }
+  .section h2 { font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: #5d7883; margin-bottom: 6px; }
+  .entry { padding: 3px 0; display: flex; justify-content: space-between; gap: 8px; }
+  .entry .label { color: #8fa6ae; white-space: nowrap; }
+  .entry .value { color: #bfe6f2; text-align: right; }
+  .boat { color: #ff6b4a; font-weight: bold; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
+  .legend span { display: flex; align-items: center; gap: 4px; }
+  .legend .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+</style>
+</head>
+<body>
+<div id="top">
+  <h1>Arctic SIM-8 Tracker</h1>
+  <span id="status" class="off">connecting...</span>
+</div>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="panel">
+    <div class="section">
+      <h2>Estimated Boat Position</h2>
+      <div class="entry"><span class="label">Lat</span><span class="value boat" id="boat-lat">--</span></div>
+      <div class="entry"><span class="label">Lon</span><span class="value boat" id="boat-lon">--</span></div>
+      <div class="entry"><span class="label">Dist</span><span class="value" id="boat-dist">--</span></div>
+    </div>
+    <div class="section">
+      <h2>Assets</h2>
+      <div id="asset-list"></div>
+    </div>
+    <div class="section">
+      <h2>Target Vessel</h2>
+      <div class="entry"><span class="label">Lat</span><span class="value" id="v-lat" style="color:#ffcc00">--</span></div>
+      <div class="entry"><span class="label">Lon</span><span class="value" id="v-lon" style="color:#ffcc00">--</span></div>
+    </div>
+    <div class="section">
+      <h2>Legend</h2>
+      <div class="legend">
+        <span><span class="dot" style="background:#57d38c"></span> Drone</span>
+        <span><span class="dot" style="background:#5bc8e0"></span> Tower</span>
+        <span><span class="dot" style="background:#ff6b4a"></span> Boat est.</span>
+        <span><span class="dot" style="background:#ffcc00"></span> Vessel</span>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const SIM_HOST = '10.99.7.1';
+const WS_URL = 'ws://' + SIM_HOST + ':8080';
+const API_URL = 'http://' + SIM_HOST + ':8090';
+
+const SITE = {
+  bounds3413: {xmin:-1505608.044159686,ymin:-1271830.812646156,xmax:-1499139.421867714,ymax:-1265362.190354184},
+  centre: {lat:71.99196,lon:-94.822428}, extent_m: 6500
+};
+const CX = (SITE.bounds3413.xmin + SITE.bounds3413.xmax) / 2;
+const CY = (SITE.bounds3413.ymin + SITE.bounds3413.ymax) / 2;
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+const PS = {a:6378137.0, e:0.081819190842621, latTs:70*D2R, lon0:-45*D2R};
+
+function ps2ll(x, y) {
+  const tc = Math.tan(Math.PI/4 - PS.latTs/2) / Math.pow((1-PS.e*Math.sin(PS.latTs))/(1+PS.e*Math.sin(PS.latTs)), PS.e/2);
+  const mc = Math.cos(PS.latTs) / Math.sqrt(1 - PS.e*PS.e * Math.sin(PS.latTs)**2);
+  const t = Math.hypot(x, y) * tc / (PS.a * mc);
+  const chi = Math.PI/2 - 2*Math.atan(t);
+  const e2=PS.e**2, e4=e2**2, e6=e4*e2, e8=e4**2;
+  const lat = chi + (e2/2+5*e4/24+e6/12+13*e8/360)*Math.sin(2*chi)
+    + (7*e4/48+29*e6/240+811*e8/11520)*Math.sin(4*chi)
+    + (7*e6/120+81*e8/1120)*Math.sin(6*chi)
+    + (4279*e8/161280)*Math.sin(8*chi);
+  const lon = PS.lon0 + Math.atan2(x, -y);
+  return [lat * R2D, ((lon * R2D + 540) % 360) - 180];
+}
+
+function ll2ps(latDeg, lonDeg) {
+  const lat = latDeg * D2R, lon = lonDeg * D2R;
+  const tc = Math.tan(Math.PI/4 - PS.latTs/2) / Math.pow((1-PS.e*Math.sin(PS.latTs))/(1+PS.e*Math.sin(PS.latTs)), PS.e/2);
+  const mc = Math.cos(PS.latTs) / Math.sqrt(1 - PS.e*PS.e * Math.sin(PS.latTs)**2);
+  const t = Math.tan(Math.PI/4 - lat/2) / Math.pow((1-PS.e*Math.sin(lat))/(1+PS.e*Math.sin(lat)), PS.e/2);
+  const rho = PS.a * mc * t / tc;
+  return [rho * Math.sin(lon - PS.lon0), -rho * Math.cos(lon - PS.lon0)];
+}
+
+function latLonToWorld(lat, lon) {
+  const [px, py] = ll2ps(lat, lon);
+  return [px - CX, py - CY];
+}
+
+function worldToLatLon(wx, wy) {
+  return ps2ll(CX + wx, CY + wy);
+}
+
+// Known asset starting positions from env config
+const KNOWN_POSITIONS = {
+  'quadcopter': {lat: 71.995807, lon: -94.839300, type: 'drone'},
+  'fixed-wing': {lat: 71.998195, lon: -94.841967, type: 'drone'},
+  'tower-1':    {lat: 71.980671, lon: -94.853711, type: 'tower'},
+  'tower-2':    {lat: 72.011778, lon: -94.804721, type: 'tower'},
+};
+
+// Canvas
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, sc, ox, oy;
+
+function resize() {
+  const r = window.devicePixelRatio || 1;
+  W = canvas.clientWidth; H = canvas.clientHeight;
+  canvas.width = W * r; canvas.height = H * r;
+  ctx.setTransform(r, 0, 0, r, 0, 0);
+  sc = Math.min(W, H) / (SITE.extent_m * 1.2);
+  ox = W / 2; oy = H / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function w2s(wx, wy) { return [ox + wx * sc, oy - wy * sc]; }
+
+// State
+const assets = {};
+let boatEstimate = null;
+let vessel = null;
+
+// Seed assets from known positions
+for (const [name, info] of Object.entries(KNOWN_POSITIONS)) {
+  const [wx, wy] = latLonToWorld(info.lat, info.lon);
+  assets[name] = { wx, wy, wz: 0, lat: info.lat, lon: info.lon, type: info.type };
+}
+
+function drawDot(x, y, r, color, label) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  if (label) {
+    ctx.fillStyle = '#8fa6ae';
+    ctx.font = '10px ui-monospace, monospace';
+    ctx.fillText(label, x + r + 4, y + 3);
+  }
+}
+
+function drawLine(x1, y1, x2, y2, color) {
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.strokeStyle = color; ctx.lineWidth = 1;
+  ctx.setLineDash([4, 4]); ctx.stroke(); ctx.setLineDash([]);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  // Grid
+  ctx.strokeStyle = '#1a2830'; ctx.lineWidth = 1;
+  const step = 500, half = SITE.extent_m / 2;
+  for (let g = -half; g <= half; g += step) {
+    let [sx, sy] = w2s(g, -half), [ex, ey] = w2s(g, half);
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+    [sx, sy] = w2s(-half, g); [ex, ey] = w2s(half, g);
+    ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(ex, ey); ctx.stroke();
+  }
+
+  // Lines from assets to boat estimate
+  if (boatEstimate) {
+    const [bx, by] = w2s(boatEstimate.wx, boatEstimate.wy);
+    for (const a of Object.values(assets)) {
+      if (a.wx !== undefined) {
+        const [ax, ay] = w2s(a.wx, a.wy);
+        drawLine(ax, ay, bx, by, 'rgba(255,107,74,0.3)');
+      }
+    }
+    const pulse = 8 + 3 * Math.sin(Date.now() / 300);
+    ctx.beginPath(); ctx.arc(bx, by, pulse + 6, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,107,74,0.15)'; ctx.fill();
+    drawDot(bx, by, pulse, '#ff6b4a', 'BOAT EST');
+  }
+
+  // Vessel
+  if (vessel) {
+    const [vx, vy] = w2s(vessel.wx, vessel.wy);
+    ctx.beginPath(); ctx.arc(vx, vy, 14, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,204,0,0.12)'; ctx.fill();
+    drawDot(vx, vy, 6, '#ffcc00', 'VESSEL');
+  }
+
+  // Assets
+  for (const [name, a] of Object.entries(assets)) {
+    if (a.wx === undefined) continue;
+    const [sx, sy] = w2s(a.wx, a.wy);
+    const color = a.type === 'tower' ? '#5bc8e0' : '#57d38c';
+    const r = a.wz > 1 ? 6 : 4;
+    drawDot(sx, sy, r, color, name + (a.wz > 1 ? ' (' + a.wz.toFixed(0) + 'm)' : ''));
+  }
+
+  requestAnimationFrame(draw);
+}
+
+// WebSocket for real-time poses (quadcopter + vessel move)
+let wsConn;
+function connectWS() {
+  const el = document.getElementById('status');
+  wsConn = new WebSocket(WS_URL);
+  wsConn.onopen = () => { el.textContent = 'connected'; el.className = ''; };
+  wsConn.onclose = () => { el.textContent = 'disconnected'; el.className = 'off'; setTimeout(connectWS, 3000); };
+  wsConn.onerror = () => {};
+  wsConn.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.topic !== '~/pose/info' || !d.msg) return;
+      const name = d.msg.name;
+      const top = name.split('::')[0];
+      const pos = d.msg.position;
+      if (!pos || name.includes('::')) return;
+
+      if (top === 'target_vessel') {
+        const [lat, lon] = worldToLatLon(pos.x, pos.y);
+        vessel = { wx: pos.x, wy: pos.y, wz: pos.z, lat, lon };
+        document.getElementById('v-lat').textContent = lat.toFixed(6);
+        document.getElementById('v-lon').textContent = lon.toFixed(6);
+      }
+
+      if (top in assets) {
+        const [lat, lon] = worldToLatLon(pos.x, pos.y);
+        Object.assign(assets[top], { wx: pos.x, wy: pos.y, wz: pos.z, lat, lon });
+      }
+    } catch(e) {}
+  };
+}
+
+function updateEstimate() {
+  if (!vessel) return;
+  const estimates = [];
+  for (const [name, a] of Object.entries(assets)) {
+    if (!a.wz || a.wz < 1) continue;
+    const dx = vessel.wx - a.wx, dy = vessel.wy - a.wy;
+    const hDist = Math.sqrt(dx*dx + dy*dy);
+    const elev = Math.atan2(a.wz, hDist) * R2D;
+    if (elev <= 0) continue;
+    const heading = Math.atan2(dx, dy);
+    const estDist = a.wz / Math.tan(elev * D2R);
+    const ewx = a.wx + Math.sin(heading) * estDist;
+    const ewy = a.wy + Math.cos(heading) * estDist;
+    estimates.push({ wx: ewx, wy: ewy });
+  }
+  if (estimates.length > 0) {
+    const avgWx = estimates.reduce((s,e) => s + e.wx, 0) / estimates.length;
+    const avgWy = estimates.reduce((s,e) => s + e.wy, 0) / estimates.length;
+    const [lat, lon] = worldToLatLon(avgWx, avgWy);
+    boatEstimate = { wx: avgWx, wy: avgWy, lat, lon };
+    document.getElementById('boat-lat').textContent = lat.toFixed(6);
+    document.getElementById('boat-lon').textContent = lon.toFixed(6);
+    const errDx = avgWx - vessel.wx, errDy = avgWy - vessel.wy;
+    document.getElementById('boat-dist').textContent = Math.sqrt(errDx*errDx + errDy*errDy).toFixed(1) + 'm error';
+  }
+  updateAssetList();
+}
+
+function updateAssetList() {
+  const el = document.getElementById('asset-list');
+  let html = '';
+  for (const [name, a] of Object.entries(assets)) {
+    const alt = a.wz > 1 ? ` alt=${a.wz.toFixed(0)}m` : '';
+    html += `<div class="entry"><span class="label">${name}</span><span class="value">${a.lat?.toFixed(4)}, ${a.lon?.toFixed(4)}${alt}</span></div>`;
+  }
+  el.innerHTML = html;
+}
+
+setInterval(updateEstimate, 1000);
+connectWS();
+draw();
+</script>
+</body>
+</html>
