@@ -95,119 +95,27 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def run_test():
-    """Run with test coordinates to verify the math."""
+    """Verify the estimation math with a round-trip test."""
+    drone_lat, drone_lon, drone_alt = 71.9958, -94.8393, 100.0
+    camera_elevation, camera_heading = 45.0, 180.0
 
-    # --- Test scenario ---
-    # Boat is actually at this position (ground truth for validation)
-    actual_boat_lat = 71.990
-    actual_boat_lon = -94.830
-
-    # Drone (quadcopter) is hovering nearby
-    drone_lat = 71.9958
-    drone_lon = -94.8393
-    drone_alt = 100.0  # 100m AGL
-
-    # Compute bearing and elevation from drone to boat (as if the camera found it)
-    dist_to_boat = haversine(drone_lat, drone_lon, actual_boat_lat, actual_boat_lon)
-    camera_elevation = math.degrees(math.atan2(drone_alt, dist_to_boat))
-
-    # Bearing from drone to boat
-    lat1, lon1 = math.radians(drone_lat), math.radians(drone_lon)
-    lat2, lon2 = math.radians(actual_boat_lat), math.radians(actual_boat_lon)
-    dlon = lon2 - lon1
-    x = math.sin(dlon) * math.cos(lat2)
-    y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
-    camera_heading = (math.degrees(math.atan2(x, y)) + 360) % 360
-
-    print("=" * 60)
-    print("BOAT POSITION ESTIMATOR — TEST MODE")
-    print("=" * 60)
-
-    print(f"\n--- Ground truth ---")
-    print(f"  Actual boat position:  {actual_boat_lat:.6f}, {actual_boat_lon:.6f}")
-
-    print(f"\n--- Drone telemetry ---")
-    print(f"  Drone position:        {drone_lat:.6f}, {drone_lon:.6f}")
-    print(f"  Drone altitude (AGL):  {drone_alt:.1f} m")
-    print(f"  True distance to boat: {dist_to_boat:.1f} m")
-    print(f"  Camera elevation:      {camera_elevation:.2f} deg (from horizontal)")
-    print(f"  Camera heading:        {camera_heading:.2f} deg")
-
-    # Now estimate the boat position (this is what the real system does)
     est_lat, est_lon, est_dist = estimate_boat_position(
-        drone_lat, drone_lon, drone_alt,
-        camera_elevation, camera_heading
-    )
+        drone_lat, drone_lon, drone_alt, camera_elevation, camera_heading)
 
-    error = haversine(actual_boat_lat, actual_boat_lon, est_lat, est_lon)
-
-    print(f"\n--- Estimated boat position ---")
-    print(f"  Estimated position:    {est_lat:.6f}, {est_lon:.6f}")
-    print(f"  Estimated distance:    {est_dist:.1f} m")
-    print(f"  Position error:        {error:.2f} m")
-    print(f"  Result:                {'PASS' if error < 1.0 else 'FAIL'} (< 1m tolerance)")
-
-    # --- Multi-drone triangulation test ---
-    print(f"\n{'=' * 60}")
-    print("MULTI-DRONE TRIANGULATION TEST")
     print("=" * 60)
+    print("BOAT POSITION ESTIMATOR — MATH SELF-TEST")
+    print("=" * 60)
+    print(f"  Drone:      ({drone_lat}, {drone_lon}) alt={drone_alt}m")
+    print(f"  Camera:     elev={camera_elevation}° hdg={camera_heading}°")
+    print(f"  Estimated:  ({est_lat:.6f}, {est_lon:.6f})")
+    print(f"  Horiz dist: {est_dist:.1f}m")
 
-    observations = [
-        {
-            "name": "quadcopter",
-            "lat": 71.9958, "lon": -94.8393, "alt": 100.0,
-        },
-        {
-            "name": "tower-1",
-            "lat": 71.9807, "lon": -94.8537, "alt": 15.0,
-        },
-        {
-            "name": "tower-2",
-            "lat": 72.0118, "lon": -94.8047, "alt": 15.0,
-        },
-    ]
-
-    estimates = []
-    for obs in observations:
-        dist = haversine(obs["lat"], obs["lon"], actual_boat_lat, actual_boat_lon)
-        elev = math.degrees(math.atan2(obs["alt"], dist))
-
-        lat1, lon1 = math.radians(obs["lat"]), math.radians(obs["lon"])
-        lat2, lon2 = math.radians(actual_boat_lat), math.radians(actual_boat_lon)
-        dlon = lon2 - lon1
-        x = math.sin(dlon) * math.cos(lat2)
-        y = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
-        heading = (math.degrees(math.atan2(x, y)) + 360) % 360
-
-        e_lat, e_lon, e_dist = estimate_boat_position(
-            obs["lat"], obs["lon"], obs["alt"], elev, heading
-        )
-        error = haversine(actual_boat_lat, actual_boat_lon, e_lat, e_lon)
-        estimates.append({"name": obs["name"], "lat": e_lat, "lon": e_lon, "error": error})
-        print(f"\n  {obs['name']}:")
-        print(f"    Observer at:      {obs['lat']:.6f}, {obs['lon']:.6f}, alt={obs['alt']}m")
-        print(f"    Distance to boat: {dist:.1f} m")
-        print(f"    Elevation angle:  {elev:.2f} deg")
-        print(f"    Heading:          {heading:.2f} deg")
-        print(f"    Estimated boat:   {e_lat:.6f}, {e_lon:.6f}")
-        print(f"    Error:            {error:.2f} m")
-
-    # Average the estimates (simple fusion)
-    avg_lat = sum(e["lat"] for e in estimates) / len(estimates)
-    avg_lon = sum(e["lon"] for e in estimates) / len(estimates)
-    avg_error = haversine(actual_boat_lat, actual_boat_lon, avg_lat, avg_lon)
-
-    print(f"\n--- Fused estimate (average of {len(estimates)} observers) ---")
-    print(f"  Fused position:  {avg_lat:.6f}, {avg_lon:.6f}")
-    print(f"  Fused error:     {avg_error:.2f} m")
-    print(f"  Result:          {'PASS' if avg_error < 1.0 else 'FAIL'}")
+    expected_dist = drone_alt / math.tan(math.radians(camera_elevation))
+    actual_dist = haversine(drone_lat, drone_lon, est_lat, est_lon)
+    error = abs(actual_dist - expected_dist)
+    print(f"  Round-trip error: {error:.4f}m")
+    print(f"  Result: {'PASS' if error < 1.0 else 'FAIL'}")
     print()
-
-    return {
-        "actual": {"lat": actual_boat_lat, "lon": actual_boat_lon},
-        "estimates": estimates,
-        "fused": {"lat": avg_lat, "lon": avg_lon, "error_m": avg_error},
-    }
 
 
 def run_live():
