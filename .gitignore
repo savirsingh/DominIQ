@@ -1,0 +1,5 @@
+SIM-8/
+__MACOSX/
+*.pdf
+__pycache__/
+*.pyc
