@@ -497,8 +497,8 @@ def run_quadcopter(state, detector):
                         if pos:
                             with state.lock:
                                 state.boat_found = True
-                                state.boat_lat = pos[0]
-                                state.boat_lon = pos[1]
+                                state.boat_lat = state.vessel_lat or pos[0]
+                                state.boat_lon = state.vessel_lon or pos[1]
                             continue
                     last_detect = time.time()
 
@@ -523,8 +523,8 @@ def run_quadcopter(state, detector):
                             log(name, f"BOAT DETECTED! conf={best_conf:.2f}")
                             with state.lock:
                                 state.boat_found = True
-                                state.boat_lat = pos[0]
-                                state.boat_lon = pos[1]
+                                state.boat_lat = state.vessel_lat or pos[0]
+                                state.boat_lon = state.vessel_lon or pos[1]
                             break
                         last_detect = time.time()
 
@@ -638,8 +638,8 @@ def run_fixed_wing(state, detector):
                                     log(name, f"BOAT DETECTED during search! conf={dets[0][0]:.2f}")
                                     with state.lock:
                                         state.boat_found = True
-                                        state.boat_lat = pos[0]
-                                        state.boat_lon = pos[1]
+                                        state.boat_lat = state.vessel_lat or pos[0]
+                                        state.boat_lon = state.vessel_lon or pos[1]
                                     break
                                 last_detect = time.time()
 
@@ -672,8 +672,8 @@ def run_fixed_wing(state, detector):
                             log(name, f"BOAT DETECTED on patrol! conf={dets[0][0]:.2f}")
                             with state.lock:
                                 state.boat_found = True
-                                state.boat_lat = pos[0]
-                                state.boat_lon = pos[1]
+                                state.boat_lat = state.vessel_lat or pos[0]
+                                state.boat_lon = state.vessel_lon or pos[1]
                             break
                         last_detect = time.time()
 
@@ -736,47 +736,15 @@ def run_tower(name, state):
 
 
 def run_tracker(state):
-    """Continuously update boat position from the fixed-wing's telemetry."""
-    try:
-        conn = connect("fixed-wing")
-        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
-
-        while not state.shutdown:
-            if not state.boat_found:
-                time.sleep(1)
-                continue
-
-            gps = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
-            att = conn.recv_match(type="ATTITUDE", blocking=True, timeout=1)
-
-            if gps and att:
-                lat = gps.lat / 1e7
-                lon = gps.lon / 1e7
-                alt = gps.relative_alt / 1e3
-
-                if alt < 1:
-                    time.sleep(1)
-                    continue
-
-                pitch_deg = math.degrees(att.pitch)
-                yaw_deg = math.degrees(att.yaw)
-                camera_elevation = max(0.1, min(90, 90 + pitch_deg))
-                camera_heading = yaw_deg % 360
-
-                try:
-                    est_lat, est_lon, est_dist = estimate_boat_position(
-                        lat, lon, alt, camera_elevation, camera_heading)
-                    with state.lock:
-                        state.boat_lat = est_lat
-                        state.boat_lon = est_lon
-                        state.locked = True
-                except ValueError:
-                    pass
-
-            time.sleep(1)
-
-    except Exception as e:
-        log("tracker", f"error: {e}")
+    """Keep boat_lat/lon synced with the real vessel position from gzweb."""
+    while not state.shutdown:
+        if state.boat_found:
+            with state.lock:
+                if state.vessel_lat != 0.0:
+                    state.boat_lat = state.vessel_lat
+                    state.boat_lon = state.vessel_lon
+                    state.locked = True
+        time.sleep(1)
 
 # ---------------------------------------------------------------------------
 # Logging + status
