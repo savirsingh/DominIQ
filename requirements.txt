@@ -1,0 +1,5 @@
+pymavlink
+opencv-python-headless
+numpy
+scikit-learn
+ultralytics

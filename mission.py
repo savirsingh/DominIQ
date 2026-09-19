@@ -2,11 +2,11 @@
 """
 Coordinated drone mission controller for Arctic SIM-8.
 
-Orchestrates all 4 assets:
+Orchestrates all 4 assets with AI-powered boat detection:
   - Quadcopter + fixed-wing: take off and circle on patrol
-  - Tower-1 + tower-2: stay still, watch for movement
+  - Tower-1 + tower-2: background-subtraction motion detection
   - When a tower detects motion → fixed-wing rushes to that area
-  - When the boat is found → fixed-wing locks on and follows it
+  - When AI detects the boat → fixed-wing locks on and follows it
 
 Usage:
     python3 mission.py
@@ -20,6 +20,9 @@ import threading
 import math
 import time
 import sys
+import os
+import cv2
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Config
@@ -32,6 +35,13 @@ ASSETS = {
     "fixed-wing": {"udp": 14560, "type": "plane",  "guided_mode": 15},
     "tower-1":    {"udp": 14580, "type": "tower",  "guided_mode": None},
     "tower-2":    {"udp": 14590, "type": "tower",  "guided_mode": None},
+}
+
+CAMERA_URLS = {
+    "quadcopter": f"http://{SIM_HOST}:8600/stream",
+    "fixed-wing": f"http://{SIM_HOST}:8610/stream",
+    "tower-1":    f"http://{SIM_HOST}:8630/stream",
+    "tower-2":    f"http://{SIM_HOST}:8640/stream",
 }
 
 SITE_CENTER = (71.99196, -94.822428)
@@ -53,35 +63,156 @@ WAYPOINT_ARRIVAL_THRESHOLD_M = 30
 
 EARTH_RADIUS = 6_371_000
 
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
+MODEL_CONF = 0.25
+DETECTION_INTERVAL = 1.5  # seconds between AI inference frames
+
 # ---------------------------------------------------------------------------
-# Shared state — teammate integration points are the booleans here
+# Shared state
 # ---------------------------------------------------------------------------
 
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
-
-        # === TEAMMATE INTEGRATION POINT ===
-        # Set these to True from your OpenCV motion-detection code.
-        # Camera feeds:
-        #   tower-1: http://10.99.7.1:8630
-        #   tower-2: http://10.99.7.1:8640
         self.tower1_detected = False
         self.tower2_detected = False
-
-        # === TEAMMATE INTEGRATION POINT ===
-        # Set boat_found = True when your AI model identifies the boat
-        # in a drone camera frame. Camera feeds:
-        #   quadcopter: http://10.99.7.1:8600
-        #   fixed-wing: http://10.99.7.1:8610
+        self.tower_bearing = None  # estimated bearing from detecting tower
         self.boat_found = False
         self.boat_lat = 0.0
         self.boat_lon = 0.0
-
         self.locked = False
         self.shutdown = False
-
         self.asset_positions = {}
+
+# ---------------------------------------------------------------------------
+# YOLO boat detector
+# ---------------------------------------------------------------------------
+
+class BoatDetector:
+    """Wraps the trained YOLO model for boat detection on camera frames."""
+
+    def __init__(self, model_path, conf=0.25):
+        self.model = None
+        self.conf = conf
+        try:
+            from ultralytics import YOLO
+            if os.path.exists(model_path):
+                self.model = YOLO(model_path)
+                log("detector", f"YOLO model loaded: {model_path}")
+            else:
+                log("detector", f"model not found at {model_path} — detection disabled")
+        except ImportError:
+            log("detector", "ultralytics not installed — detection disabled")
+
+    def detect(self, img):
+        """Returns list of (confidence, (x, y, w, h)) for detected boats."""
+        if self.model is None:
+            return []
+        results = self.model(img, conf=self.conf, verbose=False)
+        detections = []
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0])
+                detections.append((conf, (int(x1), int(y1), int(x2 - x1), int(y2 - y1))))
+        return detections
+
+# ---------------------------------------------------------------------------
+# Camera frame reader (adapted from teammate's tower_watch.Camera)
+# ---------------------------------------------------------------------------
+
+class CameraStream:
+    """Threaded MJPEG reader — grabs the latest frame from a SIM camera."""
+
+    def __init__(self, url):
+        self.url = url
+        self._frame = None
+        self._stamp = 0.0
+        self._lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            try:
+                cap = cv2.VideoCapture(self.url)
+                while cap.isOpened():
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    with self._lock:
+                        self._frame = frame
+                        self._stamp = time.time()
+                cap.release()
+            except Exception:
+                pass
+            time.sleep(1)
+
+    def latest(self, max_age=3.0):
+        with self._lock:
+            if self._frame is not None and time.time() - self._stamp <= max_age:
+                return self._frame.copy()
+        return None
+
+# ---------------------------------------------------------------------------
+# Tower motion detector (uses teammate's background subtraction approach)
+# ---------------------------------------------------------------------------
+
+class TowerWatcher:
+    """Background-subtraction motion detector for a fixed tower camera."""
+
+    def __init__(self, learn_seconds=30, sensitivity=16, min_area=30, max_area=4000, persist=8):
+        self.bg = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=sensitivity, detectShadows=False)
+        self.learn_time = learn_seconds
+        self.min_area = min_area
+        self.max_area = max_area
+        self.persist = persist
+        self.rate = 0.0005
+        self.started = time.time()
+        self.tracks = []
+        self.looks = 0
+
+    @property
+    def learning(self):
+        return time.time() - self.started < self.learn_time
+
+    def process(self, img):
+        """Feed one frame. Returns True if persistent motion detected."""
+        is_learning = self.learning
+        lr = 0.05 if is_learning else self.rate
+        mask = self.bg.apply(cv2.GaussianBlur(img, (3, 3), 0), learningRate=lr)
+        if is_learning:
+            return False
+
+        mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)[1]
+        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
+        n, _, stats, cents = cv2.connectedComponentsWithStats(mask)
+
+        blobs = []
+        for i in range(1, n):
+            area = stats[i][cv2.CC_STAT_AREA]
+            if self.min_area <= area <= self.max_area:
+                blobs.append((cents[i][0], cents[i][1]))
+
+        now = time.time()
+        for bx, by in blobs:
+            matched = False
+            for t in self.tracks:
+                if math.hypot(t["x"] - bx, t["y"] - by) < 25:
+                    t.update(x=bx, y=by, hits=t["hits"] + 1, last=now)
+                    matched = True
+                    break
+            if not matched:
+                self.tracks.append({"x": bx, "y": by, "hits": 1, "last": now, "alerted": False})
+
+        self.tracks = [t for t in self.tracks if now - t["last"] <= 3.0]
+        self.looks += 1
+
+        for t in self.tracks:
+            if t["hits"] >= self.persist and not t["alerted"]:
+                t["alerted"] = True
+                return True
+        return False
 
 # ---------------------------------------------------------------------------
 # MAVLink helpers
@@ -193,7 +324,7 @@ def generate_circle_waypoints(center_lat, center_lon, radius_m, n):
 # Asset threads
 # ---------------------------------------------------------------------------
 
-def run_quadcopter(state):
+def run_quadcopter(state, detector):
     name = "quadcopter"
     info = ASSETS[name]
     try:
@@ -220,6 +351,9 @@ def run_quadcopter(state):
 
         log(name, f"patrol started — {len(waypoints)} waypoints, {QUAD_PATROL_RADIUS_M}m radius")
 
+        cam = CameraStream(CAMERA_URLS[name])
+        last_detect = 0
+
         while not state.shutdown:
             if state.boat_found:
                 log(name, "boat found — hovering at current position")
@@ -231,6 +365,23 @@ def run_quadcopter(state):
                     time.sleep(2)
                 continue
 
+            # AI detection while patrolling
+            if time.time() - last_detect > DETECTION_INTERVAL:
+                frame = cam.latest()
+                if frame is not None and detector.model is not None:
+                    dets = detector.detect(frame)
+                    if dets:
+                        best_conf = dets[0][0]
+                        log(name, f"BOAT DETECTED! conf={best_conf:.2f}")
+                        pos = get_position(conn)
+                        if pos:
+                            with state.lock:
+                                state.boat_found = True
+                                state.boat_lat = pos[0]
+                                state.boat_lon = pos[1]
+                            continue
+                    last_detect = time.time()
+
             wlat, wlon = waypoints[wp_idx]
             send_goto(conn, wlat, wlon, QUAD_PATROL_ALT)
 
@@ -241,6 +392,22 @@ def run_quadcopter(state):
                     continue
                 with state.lock:
                     state.asset_positions[name] = pos
+
+                # Keep checking camera while flying
+                if time.time() - last_detect > DETECTION_INTERVAL:
+                    frame = cam.latest()
+                    if frame is not None and detector.model is not None:
+                        dets = detector.detect(frame)
+                        if dets:
+                            best_conf = dets[0][0]
+                            log(name, f"BOAT DETECTED! conf={best_conf:.2f}")
+                            with state.lock:
+                                state.boat_found = True
+                                state.boat_lat = pos[0]
+                                state.boat_lon = pos[1]
+                            break
+                        last_detect = time.time()
+
                 d = dist_between(pos[0], pos[1], wlat, wlon)
                 if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
                     break
@@ -258,7 +425,7 @@ def run_quadcopter(state):
             pass
 
 
-def run_fixed_wing(state):
+def run_fixed_wing(state, detector):
     name = "fixed-wing"
     info = ASSETS[name]
     try:
@@ -266,7 +433,6 @@ def run_fixed_wing(state):
         conn = connect(name)
         threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
 
-        # ArduPlane needs TAKEOFF mode (13) to launch, then switch to GUIDED (15)
         log(name, "setting TAKEOFF mode")
         set_mode(conn, 13)
 
@@ -300,6 +466,9 @@ def run_fixed_wing(state):
 
         log(name, f"patrol started — {len(waypoints)} waypoints, {PLANE_PATROL_RADIUS_M}m radius")
 
+        cam = CameraStream(CAMERA_URLS[name])
+        last_detect = 0
+
         while not state.shutdown:
             # --- Phase 3: boat found → lock on and follow ---
             if state.boat_found:
@@ -314,6 +483,18 @@ def run_fixed_wing(state):
                     if pos:
                         with state.lock:
                             state.asset_positions[name] = pos
+
+                        # Keep updating boat position from AI
+                        if time.time() - last_detect > DETECTION_INTERVAL:
+                            frame = cam.latest()
+                            if frame is not None and detector.model is not None:
+                                dets = detector.detect(frame)
+                                if dets:
+                                    with state.lock:
+                                        state.boat_lat = pos[0]
+                                        state.boat_lon = pos[1]
+                                last_detect = time.time()
+
                     time.sleep(1.5)
                 continue
 
@@ -343,6 +524,21 @@ def run_fixed_wing(state):
                             continue
                         with state.lock:
                             state.asset_positions[name] = pos
+
+                        # Check camera while searching
+                        if time.time() - last_detect > DETECTION_INTERVAL:
+                            frame = cam.latest()
+                            if frame is not None and detector.model is not None:
+                                dets = detector.detect(frame)
+                                if dets:
+                                    log(name, f"BOAT DETECTED during search! conf={dets[0][0]:.2f}")
+                                    with state.lock:
+                                        state.boat_found = True
+                                        state.boat_lat = pos[0]
+                                        state.boat_lon = pos[1]
+                                    break
+                                last_detect = time.time()
+
                         d = dist_between(pos[0], pos[1], slat, slon)
                         if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
                             break
@@ -363,6 +559,20 @@ def run_fixed_wing(state):
                     continue
                 with state.lock:
                     state.asset_positions[name] = pos
+
+                if time.time() - last_detect > DETECTION_INTERVAL:
+                    frame = cam.latest()
+                    if frame is not None and detector.model is not None:
+                        dets = detector.detect(frame)
+                        if dets:
+                            log(name, f"BOAT DETECTED on patrol! conf={dets[0][0]:.2f}")
+                            with state.lock:
+                                state.boat_found = True
+                                state.boat_lat = pos[0]
+                                state.boat_lon = pos[1]
+                            break
+                        last_detect = time.time()
+
                 d = dist_between(pos[0], pos[1], wlat, wlon)
                 if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
                     break
@@ -381,42 +591,48 @@ def run_fixed_wing(state):
 
 
 def run_tower(name, state):
+    tower_num = 1 if name == "tower-1" else 2
     try:
-        log(name, "connecting...")
+        log(name, "connecting MAVLink...")
         conn = connect(name)
         threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
 
-        log(name, "online — monitoring")
+        log(name, "starting camera stream...")
+        cam = CameraStream(CAMERA_URLS[name])
+        time.sleep(3)
+
+        log(name, "initializing motion detector (learning background ~30s)...")
+        watcher = TowerWatcher(learn_seconds=30, sensitivity=16, persist=8)
 
         while not state.shutdown:
             pos = get_position(conn)
             if pos:
                 with state.lock:
                     state.asset_positions[name] = pos
-            time.sleep(3)
 
-            # === TEAMMATE INTEGRATION POINT ===
-            # Replace this stub with your OpenCV motion detection logic.
-            # When motion is detected on this tower's camera feed:
-            #
-            #   if name == "tower-1":
-            #       state.tower1_detected = True
-            #   elif name == "tower-2":
-            #       state.tower2_detected = True
-            #
-            # Camera feeds:
-            #   tower-1: http://10.99.7.1:8630
-            #   tower-2: http://10.99.7.1:8640
+            frame = cam.latest()
+            if frame is not None:
+                motion = watcher.process(frame)
+                if motion:
+                    log(name, "MOTION DETECTED!")
+                    with state.lock:
+                        if tower_num == 1:
+                            state.tower1_detected = True
+                        else:
+                            state.tower2_detected = True
+                elif watcher.learning and watcher.looks % 30 == 0:
+                    left = watcher.learn_time - (time.time() - watcher.started)
+                    if left > 0:
+                        log(name, f"learning background... {left:.0f}s left")
+
+            time.sleep(0.3)
 
     except Exception as e:
         log(name, f"error: {e}")
 
 
 def run_tracker(state):
-    """
-    When boat_found is True, continuously update state.boat_lat/boat_lon
-    from the fixed-wing's telemetry using the position estimator.
-    """
+    """Continuously update boat position from the fixed-wing's telemetry."""
     try:
         conn = connect("fixed-wing")
         threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
@@ -485,9 +701,9 @@ def status_printer(state):
 
         flags = []
         if state.tower1_detected:
-            flags.append("tower-1:DETECTED")
+            flags.append("tower-1:MOTION")
         if state.tower2_detected:
-            flags.append("tower-2:DETECTED")
+            flags.append("tower-2:MOTION")
         if state.boat_found:
             flags.append(f"BOAT({state.boat_lat:.5f},{state.boat_lon:.5f})")
         if state.locked:
@@ -511,14 +727,16 @@ def main():
     print("=" * 60)
     print()
     print("Assets: quadcopter, fixed-wing, tower-1, tower-2")
+    print("AI: YOLO boat detection + tower motion detection")
     print("Ctrl+C to land all drones and exit")
     print()
 
     state = SharedState()
+    detector = BoatDetector(MODEL_PATH, conf=MODEL_CONF)
 
     threads = [
-        threading.Thread(target=run_quadcopter, args=(state,), name="quadcopter"),
-        threading.Thread(target=run_fixed_wing, args=(state,), name="fixed-wing"),
+        threading.Thread(target=run_quadcopter, args=(state, detector), name="quadcopter"),
+        threading.Thread(target=run_fixed_wing, args=(state, detector), name="fixed-wing"),
         threading.Thread(target=run_tower, args=("tower-1", state), name="tower-1"),
         threading.Thread(target=run_tower, args=("tower-2", state), name="tower-2"),
         threading.Thread(target=run_tracker, args=(state,), name="tracker"),
