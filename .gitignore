@@ -9,3 +9,4 @@ patrol_orig.py
 tower_output/
 patrol_output/
 output/
+.env
