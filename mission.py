@@ -53,6 +53,9 @@ PLANE_RADIUS = 2800
 PLANE_ALT = 80
 N_WAYPOINTS = 16
 ARRIVAL_M = 30
+ORBIT_RADIUS = 400    # metres — orbit the boat at this distance once found
+ORBIT_POINTS = 8      # waypoints in the orbit circle
+GOTO_INTERVAL = 5     # seconds — only resend goto when target moves this much
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 MODEL_CONF = 0.25
@@ -154,6 +157,8 @@ class Cam:
             try:
                 cap = cv2.VideoCapture(self.url)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+                cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)
                 while cap.isOpened():
                     ok, frame = cap.read()
                     if not ok:
@@ -163,7 +168,7 @@ class Cam:
                 cap.release()
             except Exception:
                 pass
-            time.sleep(2)
+            time.sleep(0.5)
 
     def grab(self):
         with self._lock:
@@ -173,7 +178,7 @@ class Cam:
 # MAVLink helpers
 # ---------------------------------------------------------------------------
 
-def mav_connect(name, udp_port, wait_ekf=False):
+def mav_connect(name, udp_port):
     addr = f"udpout:{SIM_HOST}:{udp_port}"
     conn = mavutil.mavlink_connection(addr, source_system=255)
     for _ in range(5):
@@ -182,18 +187,22 @@ def mav_connect(name, udp_port, wait_ekf=False):
         time.sleep(0.2)
     conn.mav.request_data_stream_send(0, 0, mavutil.mavlink.MAV_DATA_STREAM_ALL, 4, 1)
     conn.recv_match(type="HEARTBEAT", blocking=True, timeout=5)
-    if wait_ekf:
-        log(name, "waiting for EKF...")
-        t0 = time.time()
-        while time.time() - t0 < 40:
-            conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
-                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-            m = conn.recv_match(blocking=True, timeout=1)
-            if m and m.get_type() == "EKF_STATUS_REPORT" and m.flags & 0x1F == 0x1F:
-                log(name, f"EKF ready ({time.time()-t0:.0f}s)")
-                return conn
-        log(name, "EKF timeout, proceeding")
     return conn
+
+
+def wait_for_ekf(name, conn):
+    """Wait for EKF to be healthy. Times out after 30s."""
+    log(name, "waiting for EKF...")
+    t0 = time.time()
+    while time.time() - t0 < 30:
+        conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        m = conn.recv_match(type="EKF_STATUS_REPORT", blocking=True, timeout=1)
+        if m and m.flags & 0x1F == 0x1F:
+            log(name, f"EKF ready ({time.time()-t0:.0f}s)")
+            return True
+    log(name, "EKF wait timed out, proceeding anyway")
+    return False
 
 
 def mav_heartbeat(conn, state):
@@ -316,53 +325,36 @@ def dist_m(lat1, lon1, lat2, lon2):
 # ---------------------------------------------------------------------------
 
 def run_scanner(name, cam_url, cam_info, state):
-    """Grab frames from `cam_url`, run YOLO, update state if boat found."""
+    """Grab frames, run YOLO, always update boat position when visible."""
     cam = Cam(cam_url)
-    time.sleep(5)  # let camera start
+    time.sleep(5)
     log(name + "-scan", "scanning started")
     while not state.shutdown:
-        if state.boat_found:
-            # Keep re-estimating position from this camera
-            frame = cam.grab()
-            if frame is not None:
-                with state.lock:
-                    telem = state.positions.get(name), state.attitudes.get(name)
-                pos, att = telem
-                if pos and att:
-                    dets = yolo_detect(frame)
-                    if dets:
-                        conf, x, y, w, h = dets[0]
-                        coords = bbox_to_gps(x + w/2, y + h/2,
-                                             pos[0], pos[1], pos[2],
-                                             att[0], att[1], cam_info)
-                        if coords:
-                            with state.lock:
-                                state.boat_lat = coords[0]
-                                state.boat_lon = coords[1]
-            time.sleep(2)
-            continue
-
         frame = cam.grab()
         if frame is None:
+            time.sleep(1)
+            continue
+
+        with state.lock:
+            pos = state.positions.get(name)
+            att = state.attitudes.get(name)
+        if not pos or not att:
             time.sleep(1)
             continue
 
         dets = yolo_detect(frame)
         if dets:
             conf, x, y, w, h = dets[0]
-            with state.lock:
-                telem = state.positions.get(name), state.attitudes.get(name)
-            pos, att = telem
-            if pos and att:
-                coords = bbox_to_gps(x + w/2, y + h/2,
-                                     pos[0], pos[1], pos[2],
-                                     att[0], att[1], cam_info)
-                if coords:
-                    log(name + "-scan", f"BOAT DETECTED! conf={conf:.2f} → ({coords[0]:.6f}, {coords[1]:.6f})")
-                    with state.lock:
+            coords = bbox_to_gps(x + w/2, y + h/2,
+                                 pos[0], pos[1], pos[2],
+                                 att[0], att[1], cam_info)
+            if coords:
+                with state.lock:
+                    if not state.boat_found:
+                        log(name + "-scan", f"BOAT DETECTED! conf={conf:.2f} → ({coords[0]:.6f}, {coords[1]:.6f})")
                         state.boat_found = True
-                        state.boat_lat = coords[0]
-                        state.boat_lon = coords[1]
+                    state.boat_lat = coords[0]
+                    state.boat_lon = coords[1]
 
         time.sleep(1.5)
 
@@ -377,7 +369,8 @@ def fly_copter(state):
     conn = None
     try:
         log(name, "connecting...")
-        conn = mav_connect(name, info["udp"], wait_ekf=True)
+        conn = mav_connect(name, info["udp"])
+        wait_for_ekf(name, conn)
 
         log(name, "GUIDED mode")
         mav_set_mode(conn, info["guided_mode"])
@@ -399,17 +392,37 @@ def fly_copter(state):
         idx = 0
         log(name, f"patrol — {len(wps)} waypoints, {QUAD_RADIUS}m radius")
 
+        orbit_idx = 0
+        orbit_wps = []
+        last_orbit_center = (0, 0)
+        last_goto_time = 0
+
         while not state.shutdown:
-            # If boat found, fly toward it
+            t = mav_read(conn)
+            if t:
+                with state.lock:
+                    state.positions[name] = t[:3]
+                    state.attitudes[name] = t[3:]
+
             if state.boat_found:
                 with state.lock:
                     blat, blon = state.boat_lat, state.boat_lon
-                mav_goto(conn, blat, blon, QUAD_ALT)
-                t = mav_read(conn)
-                if t:
-                    with state.lock:
-                        state.positions[name] = t[:3]
-                        state.attitudes[name] = t[3:]
+
+                # Rebuild orbit if boat moved >50m
+                if dist_m(blat, blon, *last_orbit_center) > 50:
+                    orbit_wps = make_circle(blat, blon, ORBIT_RADIUS, ORBIT_POINTS)
+                    last_orbit_center = (blat, blon)
+                    orbit_idx = 0
+
+                if orbit_wps:
+                    owlat, owlon = orbit_wps[orbit_idx]
+                    # Only resend goto every GOTO_INTERVAL seconds
+                    if time.time() - last_goto_time > GOTO_INTERVAL:
+                        mav_goto(conn, owlat, owlon, QUAD_ALT)
+                        last_goto_time = time.time()
+                    if t and dist_m(t[0], t[1], owlat, owlon) < ARRIVAL_M:
+                        orbit_idx = (orbit_idx + 1) % len(orbit_wps)
+                        last_goto_time = 0  # force new goto
                 time.sleep(1)
                 continue
 
@@ -417,8 +430,7 @@ def fly_copter(state):
             wlat, wlon = wps[idx]
             mav_goto(conn, wlat, wlon, QUAD_ALT)
 
-            arrived = False
-            for _ in range(30):  # max 30s per waypoint
+            for _ in range(30):
                 if state.shutdown or state.boat_found:
                     break
                 t = mav_read(conn)
@@ -427,7 +439,6 @@ def fly_copter(state):
                         state.positions[name] = t[:3]
                         state.attitudes[name] = t[3:]
                     if dist_m(t[0], t[1], wlat, wlon) < ARRIVAL_M:
-                        arrived = True
                         break
                 time.sleep(1)
 
@@ -448,7 +459,8 @@ def fly_plane(state):
     conn = None
     try:
         log(name, "connecting...")
-        conn = mav_connect(name, info["udp"], wait_ekf=True)
+        conn = mav_connect(name, info["udp"])
+        wait_for_ekf(name, conn)
 
         # Plane: TAKEOFF mode → arm → takeoff → switch to GUIDED
         log(name, "TAKEOFF mode")
@@ -477,16 +489,35 @@ def fly_plane(state):
         idx = 0
         log(name, f"patrol — {len(wps)} waypoints, {PLANE_RADIUS}m radius")
 
+        orbit_idx = 0
+        orbit_wps = []
+        last_orbit_center = (0, 0)
+        last_goto_time = 0
+
         while not state.shutdown:
+            t = mav_read(conn)
+            if t:
+                with state.lock:
+                    state.positions[name] = t[:3]
+                    state.attitudes[name] = t[3:]
+
             if state.boat_found:
                 with state.lock:
                     blat, blon = state.boat_lat, state.boat_lon
-                mav_goto(conn, blat, blon, PLANE_ALT)
-                t = mav_read(conn)
-                if t:
-                    with state.lock:
-                        state.positions[name] = t[:3]
-                        state.attitudes[name] = t[3:]
+
+                if dist_m(blat, blon, *last_orbit_center) > 50:
+                    orbit_wps = make_circle(blat, blon, ORBIT_RADIUS, ORBIT_POINTS)
+                    last_orbit_center = (blat, blon)
+                    orbit_idx = 0
+
+                if orbit_wps:
+                    owlat, owlon = orbit_wps[orbit_idx]
+                    if time.time() - last_goto_time > GOTO_INTERVAL:
+                        mav_goto(conn, owlat, owlon, PLANE_ALT)
+                        last_goto_time = time.time()
+                    if t and dist_m(t[0], t[1], owlat, owlon) < ARRIVAL_M:
+                        orbit_idx = (orbit_idx + 1) % len(orbit_wps)
+                        last_goto_time = 0
                 time.sleep(1)
                 continue
 
@@ -520,38 +551,31 @@ def fly_plane(state):
 
 def run_tower(name, state):
     info = TOWER_CAMS[name]
+    cam_info = info  # same keys: width, height, hfov; mount_pitch = 0 (tower points itself)
     try:
         log(name, "connecting...")
         conn = mav_connect(name, info["udp"])
         threading.Thread(target=mav_heartbeat, args=(conn, state), daemon=True).start()
 
-        cam = Cam(info["cam"])
-        time.sleep(3)
-        log(name, "scanning with YOLO")
+        # Seed the tower's position immediately from GPS
+        t = mav_read(conn)
+        if t:
+            with state.lock:
+                state.positions[name] = t[:3]
+                state.attitudes[name] = t[3:]
 
+        # Launch YOLO scanner thread — same as drones
+        threading.Thread(target=run_scanner, args=(name, info["cam"], cam_info, state),
+                         daemon=True).start()
+
+        # Keep reading telemetry so scanner has fresh attitude
         while not state.shutdown:
-            # Read tower position + attitude
             t = mav_read(conn)
             if t:
                 with state.lock:
                     state.positions[name] = t[:3]
                     state.attitudes[name] = t[3:]
-
-            frame = cam.grab()
-            if frame is not None:
-                dets = yolo_detect(frame)
-                if dets and not state.boat_found:
-                    conf, x, y, w, h = dets[0]
-                    log(name, f"BOAT SPOTTED by tower! conf={conf:.2f}")
-                    # Towers are static so we can't triangulate well,
-                    # but we flag it so drones know to search this area
-                    with state.lock:
-                        state.boat_found = True
-                        # Use tower position as rough estimate
-                        state.boat_lat = t[0] if t else 0
-                        state.boat_lon = t[1] if t else 0
-
-            time.sleep(2)
+            time.sleep(1)
 
     except Exception as e:
         log(name, f"error: {e}")
