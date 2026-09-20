@@ -229,16 +229,20 @@ def mav_set_mode(conn, mode):
 
 
 def mav_arm(conn, name):
-    for _ in range(5):
+    for attempt in range(5):
         conn.mav.command_long_send(conn.target_system, conn.target_component,
                                    mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                                    0, 1, 0, 0, 0, 0, 0, 0)
         t0 = time.time()
-        while time.time() - t0 < 4:
-            conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
-                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-            m = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
-            if m and m.base_mode & 128:
+        last_hb = 0
+        while time.time() - t0 < 5:
+            now = time.time()
+            if now - last_hb > 0.5:
+                conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                        mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+                last_hb = now
+            m = conn.recv_match(blocking=True, timeout=0.3)
+            if m and m.get_type() == "HEARTBEAT" and m.base_mode & 128:
                 return True
         time.sleep(1)
     return False
@@ -249,13 +253,17 @@ def mav_takeoff(conn, alt, state, timeout=60):
                                mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
                                0, 0, 0, 0, 0, 0, 0, alt)
     t0 = time.time()
+    last_hb = 0
     while time.time() - t0 < timeout and not state.shutdown:
-        conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
-                                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-        m = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
-        if m and m.relative_alt / 1e3 >= alt * 0.8:
-            return True
-        time.sleep(0.5)
+        now = time.time()
+        if now - last_hb > 0.5:
+            conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            last_hb = now
+        m = conn.recv_match(blocking=True, timeout=0.5)
+        if m and m.get_type() == "GLOBAL_POSITION_INT":
+            if m.relative_alt / 1e3 >= alt * 0.8:
+                return True
     return False
 
 
@@ -629,7 +637,12 @@ def main():
         threading.Thread(target=run_tower, args=("tower-2", state), daemon=True),
         threading.Thread(target=status_loop, args=(state,), daemon=True),
     ]
-    for t in threads:
+    # Stagger drone startups to avoid MAVLink message contention
+    threads[0].start()  # quadcopter
+    time.sleep(3)
+    threads[1].start()  # fixed-wing
+    time.sleep(1)
+    for t in threads[2:]:
         t.start()
 
     try:
