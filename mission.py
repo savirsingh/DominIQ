@@ -15,20 +15,14 @@ Press Ctrl+C to land all drones and shut down.
 """
 
 from pymavlink import mavutil
-from tracker import estimate_boat_position, haversine
+from tracker import estimate_boat_position, haversine, offset_lat_lon
 import threading
 import math
 import time
 import sys
 import os
-import json
 import cv2
 import numpy as np
-
-try:
-    import websocket as _ws_mod
-except ImportError:
-    _ws_mod = None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -73,68 +67,51 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 MODEL_CONF = 0.25
 DETECTION_INTERVAL = 1.5  # seconds between AI inference frames
 
-WS_URL = f"ws://{SIM_HOST}:8080"
-
-# EPSG:3413 site bounds for coordinate conversion
-SITE_BOUNDS = {
-    "xmin": -1505608.044159686, "ymin": -1271830.812646156,
-    "xmax": -1499139.421867714, "ymax": -1265362.190354184,
+# Camera specs from the SIM models
+CAMERAS = {
+    "quadcopter": {"width": 960, "height": 720, "hfov": 2.0, "mount_pitch": 0.0},
+    "fixed-wing": {"width": 1280, "height": 720, "hfov": 1.204, "mount_pitch": 0.14},
 }
-SITE_CX = (SITE_BOUNDS["xmin"] + SITE_BOUNDS["xmax"]) / 2
-SITE_CY = (SITE_BOUNDS["ymin"] + SITE_BOUNDS["ymax"]) / 2
-D2R = math.pi / 180
-R2D = 180 / math.pi
-PS_A = 6378137.0
-PS_E = 0.081819190842621
-PS_LAT_TS = 70 * D2R
-PS_LON0 = -45 * D2R
 
 # ---------------------------------------------------------------------------
-# Coordinate conversion (world coords ↔ lat/lon via polar stereographic)
+# Camera-based boat position estimation
 # ---------------------------------------------------------------------------
 
-def world_to_latlon(wx, wy):
-    x, y = SITE_CX + wx, SITE_CY + wy
-    tc = math.tan(math.pi / 4 - PS_LAT_TS / 2) / ((1 - PS_E * math.sin(PS_LAT_TS)) / (1 + PS_E * math.sin(PS_LAT_TS))) ** (PS_E / 2)
-    mc = math.cos(PS_LAT_TS) / math.sqrt(1 - PS_E ** 2 * math.sin(PS_LAT_TS) ** 2)
-    t = math.hypot(x, y) * tc / (PS_A * mc)
-    chi = math.pi / 2 - 2 * math.atan(t)
-    e2 = PS_E ** 2; e4 = e2 ** 2; e6 = e4 * e2; e8 = e4 ** 2
-    lat = chi + (e2/2+5*e4/24+e6/12+13*e8/360)*math.sin(2*chi) \
-        + (7*e4/48+29*e6/240+811*e8/11520)*math.sin(4*chi) \
-        + (7*e6/120+81*e8/1120)*math.sin(6*chi) \
-        + (4279*e8/161280)*math.sin(8*chi)
-    lon = PS_LON0 + math.atan2(x, -y)
-    return lat * R2D, ((lon * R2D + 540) % 360) - 180
+def bbox_to_boat_coords(bbox, drone_lat, drone_lon, drone_alt, heading_deg, pitch_deg, cam_name):
+    """Estimate boat GPS from a YOLO bounding box + drone telemetry.
 
-# ---------------------------------------------------------------------------
-# Vessel position tracker (reads gzweb WebSocket for ground-truth boat pose)
-# ---------------------------------------------------------------------------
+    bbox: (x, y, w, h) in pixels — the detection box
+    Returns (lat, lon) or None if geometry doesn't work.
+    """
+    cam = CAMERAS.get(cam_name)
+    if not cam or drone_alt < 2:
+        return None
 
-def run_vessel_tracker(state):
-    """Track the target vessel's real position via the gzweb WebSocket."""
-    if _ws_mod is None:
-        log("vessel", "websocket module not installed — vessel tracking disabled")
-        return
-    while not state.shutdown:
-        try:
-            ws = _ws_mod.create_connection(WS_URL, timeout=5)
-            ws.settimeout(0.5)
-            while not state.shutdown:
-                try:
-                    raw = ws.recv()
-                    d = json.loads(raw)
-                    if d.get("topic") == "~/pose/info" and d.get("msg", {}).get("name") == "target_vessel":
-                        pos = d["msg"]["position"]
-                        lat, lon = world_to_latlon(pos["x"], pos["y"])
-                        with state.lock:
-                            state.vessel_lat = lat
-                            state.vessel_lon = lon
-                except Exception:
-                    pass
-            ws.close()
-        except Exception:
-            time.sleep(3)
+    bx, by, bw, bh = bbox
+    cx = bx + bw / 2
+    cy = by + bh / 2
+
+    img_w, img_h = cam["width"], cam["height"]
+    focal_px = (img_w / 2) / math.tan(cam["hfov"] / 2)
+
+    az_offset = math.atan2(cx - img_w / 2, focal_px)
+    el_offset = math.atan2(img_h / 2 - cy, focal_px)
+
+    body_pitch_rad = math.radians(pitch_deg)
+    cam_pitch = body_pitch_rad - cam["mount_pitch"]
+    look_down = -(cam_pitch + el_offset)
+
+    if look_down <= 0.01:
+        return None
+
+    ground_dist = drone_alt / math.tan(look_down)
+    if ground_dist > 5000 or ground_dist < 0:
+        return None
+
+    bearing_rad = math.radians(heading_deg) + az_offset
+
+    boat_lat, boat_lon = offset_lat_lon(drone_lat, drone_lon, ground_dist, bearing_rad)
+    return boat_lat, boat_lon
 
 # ---------------------------------------------------------------------------
 # Shared state
@@ -149,11 +126,10 @@ class SharedState:
         self.boat_found = False
         self.boat_lat = 0.0
         self.boat_lon = 0.0
-        self.vessel_lat = 0.0  # real vessel position from gzweb
-        self.vessel_lon = 0.0
         self.locked = False
         self.shutdown = False
         self.asset_positions = {}
+        self.asset_attitudes = {}  # {name: (heading_deg, pitch_deg)}
 
 # ---------------------------------------------------------------------------
 # YOLO boat detector
@@ -187,6 +163,18 @@ class BoatDetector:
                 conf = float(box.conf[0])
                 detections.append((conf, (int(x1), int(y1), int(x2 - x1), int(y2 - y1))))
         return detections
+
+    def detect_and_locate(self, img, drone_lat, drone_lon, drone_alt, heading_deg, pitch_deg, cam_name):
+        """Detect boat AND estimate its GPS coords from the camera geometry.
+        Returns (confidence, boat_lat, boat_lon) or None."""
+        dets = self.detect(img)
+        if not dets:
+            return None
+        best_conf, best_bbox = dets[0]
+        coords = bbox_to_boat_coords(best_bbox, drone_lat, drone_lon, drone_alt, heading_deg, pitch_deg, cam_name)
+        if coords is None:
+            return None
+        return (best_conf, coords[0], coords[1])
 
 # ---------------------------------------------------------------------------
 # Camera frame reader (adapted from teammate's tower_watch.Camera)
@@ -397,6 +385,22 @@ def get_position(conn):
     return (gps.lat / 1e7, gps.lon / 1e7, gps.relative_alt / 1e3)
 
 
+def get_telemetry(conn):
+    """Get position + attitude. Returns (lat, lon, alt, heading_deg, pitch_deg) or None."""
+    gps = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
+    if not gps:
+        return None
+    att = conn.recv_match(type="ATTITUDE", blocking=True, timeout=1)
+    lat = gps.lat / 1e7
+    lon = gps.lon / 1e7
+    alt = gps.relative_alt / 1e3
+    heading = gps.hdg / 100.0
+    pitch = math.degrees(att.pitch) if att else 0.0
+    if att:
+        heading = math.degrees(att.yaw) % 360
+    return (lat, lon, alt, heading, pitch)
+
+
 def send_goto(conn, lat, lon, alt):
     conn.mav.set_position_target_global_int_send(
         0, conn.target_system, conn.target_component,
@@ -472,63 +476,49 @@ def run_quadcopter(state, detector):
 
         while not state.shutdown:
             if state.boat_found:
-                log(name, "boat found — flying to vessel")
+                log(name, "boat found — flying to boat position")
                 while state.boat_found and not state.shutdown:
                     with state.lock:
-                        vlat, vlon = state.vessel_lat, state.vessel_lon
-                    if vlat != 0.0 and vlon != 0.0:
-                        send_goto(conn, vlat, vlon, QUAD_PATROL_ALT)
-                    pos = get_position(conn)
-                    if pos:
+                        blat, blon = state.boat_lat, state.boat_lon
+                    if blat != 0.0 and blon != 0.0:
+                        send_goto(conn, blat, blon, QUAD_PATROL_ALT)
+                    telem = get_telemetry(conn)
+                    if telem:
                         with state.lock:
-                            state.asset_positions[name] = pos
+                            state.asset_positions[name] = telem[:3]
+                            state.asset_attitudes[name] = telem[3:]
                     time.sleep(1.5)
                 continue
 
             # AI detection while patrolling
-            if time.time() - last_detect > DETECTION_INTERVAL:
-                frame = cam.latest()
-                if frame is not None and detector.model is not None:
-                    dets = detector.detect(frame)
-                    if dets:
-                        best_conf = dets[0][0]
-                        log(name, f"BOAT DETECTED! conf={best_conf:.2f}")
-                        pos = get_position(conn)
-                        if pos:
-                            with state.lock:
-                                state.boat_found = True
-                                state.boat_lat = state.vessel_lat or pos[0]
-                                state.boat_lon = state.vessel_lon or pos[1]
-                            continue
-                    last_detect = time.time()
-
             wlat, wlon = waypoints[wp_idx]
             send_goto(conn, wlat, wlon, QUAD_PATROL_ALT)
 
             while not state.shutdown and not state.boat_found:
-                pos = get_position(conn)
-                if not pos:
+                telem = get_telemetry(conn)
+                if not telem:
                     time.sleep(0.5)
                     continue
+                lat, lon, alt, hdg, pitch = telem
                 with state.lock:
-                    state.asset_positions[name] = pos
+                    state.asset_positions[name] = (lat, lon, alt)
+                    state.asset_attitudes[name] = (hdg, pitch)
 
-                # Keep checking camera while flying
                 if time.time() - last_detect > DETECTION_INTERVAL:
                     frame = cam.latest()
                     if frame is not None and detector.model is not None:
-                        dets = detector.detect(frame)
-                        if dets:
-                            best_conf = dets[0][0]
-                            log(name, f"BOAT DETECTED! conf={best_conf:.2f}")
+                        result = detector.detect_and_locate(frame, lat, lon, alt, hdg, pitch, name)
+                        if result:
+                            conf, blat, blon = result
+                            log(name, f"BOAT DETECTED! conf={conf:.2f} → ({blat:.6f}, {blon:.6f})")
                             with state.lock:
                                 state.boat_found = True
-                                state.boat_lat = state.vessel_lat or pos[0]
-                                state.boat_lon = state.vessel_lon or pos[1]
+                                state.boat_lat = blat
+                                state.boat_lon = blon
                             break
                         last_detect = time.time()
 
-                d = dist_between(pos[0], pos[1], wlat, wlon)
+                d = dist_between(lat, lon, wlat, wlon)
                 if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
                     break
                 time.sleep(1)
@@ -585,20 +575,29 @@ def run_fixed_wing(state, detector):
         while not state.shutdown:
             # --- Phase 3: boat found → lock on and follow ---
             if state.boat_found:
-                log(name, "BOAT FOUND — locking on to vessel")
+                log(name, "BOAT FOUND — locking on, tracking from camera")
                 state.locked = True
                 while state.boat_found and not state.shutdown:
                     with state.lock:
-                        vlat, vlon = state.vessel_lat, state.vessel_lon
-                    if vlat != 0.0 and vlon != 0.0:
-                        send_goto(conn, vlat, vlon, PLANE_PATROL_ALT)
+                        blat, blon = state.boat_lat, state.boat_lon
+                    if blat != 0.0 and blon != 0.0:
+                        send_goto(conn, blat, blon, PLANE_PATROL_ALT)
+                    telem = get_telemetry(conn)
+                    if telem:
+                        lat, lon, alt, hdg, pitch = telem
                         with state.lock:
-                            state.boat_lat = vlat
-                            state.boat_lon = vlon
-                    pos = get_position(conn)
-                    if pos:
-                        with state.lock:
-                            state.asset_positions[name] = pos
+                            state.asset_positions[name] = (lat, lon, alt)
+                            state.asset_attitudes[name] = (hdg, pitch)
+                        if time.time() - last_detect > DETECTION_INTERVAL:
+                            frame = cam.latest()
+                            if frame is not None and detector.model is not None:
+                                result = detector.detect_and_locate(frame, lat, lon, alt, hdg, pitch, name)
+                                if result:
+                                    conf, new_blat, new_blon = result
+                                    with state.lock:
+                                        state.boat_lat = new_blat
+                                        state.boat_lon = new_blon
+                                last_detect = time.time()
                     time.sleep(1.5)
                 continue
 
@@ -622,28 +621,30 @@ def run_fixed_wing(state, detector):
                     send_goto(conn, slat, slon, PLANE_PATROL_ALT)
 
                     while not state.shutdown and not state.boat_found:
-                        pos = get_position(conn)
-                        if not pos:
+                        telem = get_telemetry(conn)
+                        if not telem:
                             time.sleep(0.5)
                             continue
                         with state.lock:
-                            state.asset_positions[name] = pos
+                            state.asset_positions[name] = telem[:3]
+                            state.asset_attitudes[name] = telem[3:]
 
                         # Check camera while searching
                         if time.time() - last_detect > DETECTION_INTERVAL:
                             frame = cam.latest()
                             if frame is not None and detector.model is not None:
-                                dets = detector.detect(frame)
-                                if dets:
-                                    log(name, f"BOAT DETECTED during search! conf={dets[0][0]:.2f}")
+                                result = detector.detect_and_locate(frame, *telem, name)
+                                if result:
+                                    conf, blat, blon = result
+                                    log(name, f"BOAT DETECTED during search! conf={conf:.2f} → ({blat:.6f}, {blon:.6f})")
                                     with state.lock:
                                         state.boat_found = True
-                                        state.boat_lat = state.vessel_lat or pos[0]
-                                        state.boat_lon = state.vessel_lon or pos[1]
+                                        state.boat_lat = blat
+                                        state.boat_lon = blon
                                     break
                                 last_detect = time.time()
 
-                        d = dist_between(pos[0], pos[1], slat, slon)
+                        d = dist_between(telem[0], telem[1], slat, slon)
                         if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
                             break
                         time.sleep(1)
@@ -657,27 +658,30 @@ def run_fixed_wing(state, detector):
 
             while not state.shutdown and not state.boat_found \
                     and not state.tower1_detected and not state.tower2_detected:
-                pos = get_position(conn)
-                if not pos:
+                telem = get_telemetry(conn)
+                if not telem:
                     time.sleep(0.5)
                     continue
+                lat, lon, alt, hdg, pitch = telem
                 with state.lock:
-                    state.asset_positions[name] = pos
+                    state.asset_positions[name] = (lat, lon, alt)
+                    state.asset_attitudes[name] = (hdg, pitch)
 
                 if time.time() - last_detect > DETECTION_INTERVAL:
                     frame = cam.latest()
                     if frame is not None and detector.model is not None:
-                        dets = detector.detect(frame)
-                        if dets:
-                            log(name, f"BOAT DETECTED on patrol! conf={dets[0][0]:.2f}")
+                        result = detector.detect_and_locate(frame, lat, lon, alt, hdg, pitch, name)
+                        if result:
+                            conf, blat, blon = result
+                            log(name, f"BOAT DETECTED on patrol! conf={conf:.2f} → ({blat:.6f}, {blon:.6f})")
                             with state.lock:
                                 state.boat_found = True
-                                state.boat_lat = state.vessel_lat or pos[0]
-                                state.boat_lon = state.vessel_lon or pos[1]
+                                state.boat_lat = blat
+                                state.boat_lon = blon
                             break
                         last_detect = time.time()
 
-                d = dist_between(pos[0], pos[1], wlat, wlon)
+                d = dist_between(lat, lon, wlat, wlon)
                 if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
                     break
                 time.sleep(1)
@@ -735,16 +739,37 @@ def run_tower(name, state):
         log(name, f"error: {e}")
 
 
-def run_tracker(state):
-    """Keep boat_lat/lon synced with the real vessel position from gzweb."""
-    while not state.shutdown:
-        if state.boat_found:
-            with state.lock:
-                if state.vessel_lat != 0.0:
-                    state.boat_lat = state.vessel_lat
-                    state.boat_lon = state.vessel_lon
-                    state.locked = True
-        time.sleep(1)
+def run_tracker(state, detector):
+    """Continuously re-estimate boat position from the fixed-wing's camera."""
+    try:
+        conn = connect("fixed-wing")
+        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
+        cam = CameraStream(CAMERA_URLS["fixed-wing"])
+        cam_name = "fixed-wing"
+
+        while not state.shutdown:
+            if not state.boat_found:
+                time.sleep(1)
+                continue
+
+            telem = get_telemetry(conn)
+            if not telem or telem[2] < 2:
+                time.sleep(1)
+                continue
+
+            frame = cam.latest()
+            if frame is not None and detector.model is not None:
+                result = detector.detect_and_locate(frame, *telem, cam_name)
+                if result:
+                    _, blat, blon = result
+                    with state.lock:
+                        state.boat_lat = blat
+                        state.boat_lon = blon
+                        state.locked = True
+            time.sleep(DETECTION_INTERVAL)
+
+    except Exception as e:
+        log("tracker", f"error: {e}")
 
 # ---------------------------------------------------------------------------
 # Logging + status
@@ -776,8 +801,6 @@ def status_printer(state):
             flags.append("tower-1:MOTION")
         if state.tower2_detected:
             flags.append("tower-2:MOTION")
-        if state.vessel_lat != 0:
-            flags.append(f"VESSEL({state.vessel_lat:.5f},{state.vessel_lon:.5f})")
         if state.boat_found:
             flags.append(f"BOAT({state.boat_lat:.5f},{state.boat_lon:.5f})")
         if state.locked:
@@ -809,12 +832,11 @@ def main():
     detector = BoatDetector(MODEL_PATH, conf=MODEL_CONF)
 
     threads = [
-        threading.Thread(target=run_vessel_tracker, args=(state,), name="vessel"),
         threading.Thread(target=run_quadcopter, args=(state, detector), name="quadcopter"),
         threading.Thread(target=run_fixed_wing, args=(state, detector), name="fixed-wing"),
         threading.Thread(target=run_tower, args=("tower-1", state), name="tower-1"),
         threading.Thread(target=run_tower, args=("tower-2", state), name="tower-2"),
-        threading.Thread(target=run_tracker, args=(state,), name="tracker"),
+        threading.Thread(target=run_tracker, args=(state, detector), name="tracker"),
         threading.Thread(target=status_printer, args=(state,), name="status"),
     ]
 
