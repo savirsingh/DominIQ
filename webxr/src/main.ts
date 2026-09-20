@@ -18,10 +18,13 @@ import {
   createSystem,
 } from '@iwsdk/core';
 import projectOptions from 'virtual:iwsdk-project';
+import { BoatAlert } from './alert';
 import { TelemetryFeed } from './feed';
-import { PinField, type PinDefinition } from './pins';
+import { HudToast } from './hud-toast';
+import { PinField, type PinDefinition, type PinPointer } from './pins';
 import { loadTerrain, type TerrainMap } from './terrain';
 import { SpeechTranscriber, type TranscriberStatus } from './transcriber';
+import { VoiceAssistant, type VoiceEvent } from './voice';
 import './style.css';
 
 const container = document.querySelector<HTMLDivElement>('#scene-container');
@@ -32,19 +35,26 @@ const SITE = new URLSearchParams(location.search).get('site') ?? 'fort_ross';
 /** Edge of the square terrain map on the table, in meters. */
 const MAP_WIDTH_M = 0.9;
 
+/** Hold to talk to the assistant (release to send): B on the right controller, Y on the left. */
+const TALK_BUTTON_RIGHT = 'b-button';
+const TALK_BUTTON_LEFT = 'y-button';
+
 /** Names match the assets the bridge reports (arctic-sim roles, plus the tracked vessel). */
 const PIN_DEFINITIONS: ReadonlyArray<PinDefinition> = [
-  { name: 'quadcopter', kind: 'copter', color: 0x3498db },
-  { name: 'fixed-wing', kind: 'plane', color: 0xf39c12 },
-  { name: 'tower-1', kind: 'tower', color: 0x2ecc71 },
-  { name: 'tower-2', kind: 'tower', color: 0x2ecc71 },
-  { name: 'boat', kind: 'boat', color: 0xe74c3c },
+  { name: 'quadcopter', kind: 'copter', color: 0x3498db, camera: true },
+  { name: 'fixed-wing', kind: 'plane', color: 0xf39c12, camera: true },
+  { name: 'tower-1', kind: 'tower', color: 0x2ecc71, camera: true },
+  { name: 'tower-2', kind: 'tower', color: 0x2ecc71, camera: true },
+  { name: 'boat', kind: 'boat', color: 0xe74c3c, glow: true },
 ];
 
 let settingsRoot: Object3D | null = null;
 let settingsVisible = true;
 let placementSystem: MapPlacementSystem | null = null;
 let terrainMap: TerrainMap | null = null;
+let boatAlert: BoatAlert | null = null;
+let assistantHud: HudToast | null = null;
+let voice: VoiceAssistant | null = null;
 
 /** Whether the main loop may run (still to be defined). Turns on when the user confirms the map. */
 let ready = false;
@@ -64,6 +74,33 @@ function refreshPlacementHud(): void {
   placementActions?.setProperties({ display: mapPlaced ? 'flex' : 'none' });
 }
 
+/** What the assistant is doing, on the card in view. */
+function showVoiceEvent(event: VoiceEvent): void {
+  const hud = assistantHud;
+  if (!hud) return;
+  switch (event.kind) {
+    case 'listening':
+      hud.show('listening', 'Speak now, then release the button.');
+      break;
+    case 'thinking':
+      hud.show('thinking', 'Working on it...');
+      break;
+    case 'answer':
+      // While it is speaking the card stays; with no voice it stays long enough to read.
+      hud.show('answer', event.answer, event.speaking ? null : Math.max(4, event.answer.length * 0.06), event.question);
+      break;
+    case 'speech-ended':
+      hud.hideAfter(2.5);
+      break;
+    case 'cancelled':
+      hud.show('notice', event.reason, 2);
+      break;
+    case 'error':
+      hud.show('error', event.message, 5);
+      break;
+  }
+}
+
 function setSettingsVisible(visible: boolean): void {
   settingsVisible = visible;
   if (settingsRoot) settingsRoot.visible = visible;
@@ -81,6 +118,7 @@ class MapPlacementSystem extends createSystem({
   private mapMarker: Object3D | null = null;
   private pins: PinField | null = null;
   private targets: Array<{ entity: any; hand: 'left' | 'right' }> = [];
+  private wasTalking = false;
 
   init(): void {
     placementSystem = this;
@@ -130,6 +168,18 @@ class MapPlacementSystem extends createSystem({
   }
 
   update(delta: number): void {
+    boatAlert?.update(delta);
+    assistantHud?.update(delta);
+
+    // Push-to-talk: the button going down starts a recording, coming up sends it.
+    const talking =
+      this.input.xr.gamepads.right?.getButtonPressed(TALK_BUTTON_RIGHT) === true ||
+      this.input.xr.gamepads.left?.getButtonPressed(TALK_BUTTON_LEFT) === true;
+    if (talking !== this.wasTalking) {
+      this.wasTalking = talking;
+      void (talking ? voice?.press() : voice?.release());
+    }
+
     const leftGrip = this.input.xr.gamepads.left?.getButtonDown('xr-standard-squeeze') === true;
     const rightGrip = this.input.xr.gamepads.right?.getButtonDown('xr-standard-squeeze') === true;
     if (leftGrip || rightGrip) {
@@ -138,10 +188,11 @@ class MapPlacementSystem extends createSystem({
 
     if (this.pins) {
       const { head, raySpaces } = this.world.player;
-      const rays: Object3D[] = [];
-      if (this.input.xr.gamepads.left) rays.push(raySpaces.left);
-      if (this.input.xr.gamepads.right) rays.push(raySpaces.right);
-      this.pins.update(delta, ready, !settingsVisible, head, rays);
+      const { left, right } = this.input.xr.gamepads;
+      const pointers: PinPointer[] = [];
+      if (left) pointers.push({ space: raySpaces.left, select: left.getSelectStart() === true });
+      if (right) pointers.push({ space: raySpaces.right, select: right.getSelectStart() === true });
+      this.pins.update(delta, ready, !settingsVisible, head, pointers);
     }
 
     for (const { entity: target, hand } of this.targets) {
@@ -212,10 +263,36 @@ refreshPlacementHud();
 const pinLabels = await Promise.all(
   PIN_DEFINITIONS.map(() => world.assets.instantiate<UIKitMLAsset>('orbLabel')),
 );
-const pins = new PinField(PIN_DEFINITIONS, pinLabels, terrainMap);
+// Locking a pin opens its camera. The dev server proxies /cam/<asset> to the sim's MJPEG port.
+const pins = new PinField(PIN_DEFINITIONS, pinLabels, terrainMap, {
+  cameraUrl: (name) => `${import.meta.env.BASE_URL}cam/${name}`,
+});
 const attachPins = (field: PinField): void => placementSystem?.attachPins(field);
 attachPins(pins);
-new TelemetryFeed(undefined, 250, (assets) => pins.setAssets(assets), (status) => console.info(`[feed] ${status}`)).start();
+// The alert rides on the head so it stays in view. It fires once, for the first boat sighting.
+boatAlert = new BoatAlert();
+world.player.head.add(boatAlert.group);
+
+// Voice assistant: hold the talk button, speak, release. The card in view shows what it is doing.
+assistantHud = new HudToast();
+world.player.head.add(assistantHud.group);
+voice = new VoiceAssistant({
+  url: `${import.meta.env.BASE_URL}ask`,
+  getFocus: () => pins.focus,
+  onEvent: showVoiceEvent,
+});
+// Browsers only grant the microphone and allow audio after a click. Do it on the first click anywhere,
+// which covers both our Enter AR button and the SDK's own, and is before the immersive session starts.
+document.addEventListener('click', () => void voice?.prepare(), { once: true, capture: true });
+new TelemetryFeed(
+  undefined,
+  250,
+  (assets) => {
+    pins.setAssets(assets);
+    boatAlert?.observe(assets);
+  },
+  (status) => console.info(`[feed] ${status}`),
+).start();
 
 const enterAr = settings.requireElementById('enter-ar');
 enterAr.addEventListener('click', () => world.launchXR());

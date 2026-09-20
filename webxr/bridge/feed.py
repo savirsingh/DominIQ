@@ -12,13 +12,13 @@ The headset page polls GET /positions (the vite dev server proxies /feed/positio
 
 `alt` is metres above mean sea level (GLOBAL_POSITION_INT.alt). The sim keeps that equal to world z,
 and the terrain's sea level is z = 0, so the client plots it directly. `age` is seconds since the
-asset was last heard from.
+asset was last heard from; `first_seen_age` is seconds since it was first heard from, which the page
+uses to alert only for a boat that was found just now.
 
 WITH THE MISSION RUNNING, do not use --sim: it would be a second MAVLink client on each asset's
 port, and the sim's MAVProxy udpin listeners are only known to serve one (not tested). Let
 mission.py serve this feed instead. It already holds the connections and the boat estimate:
 
-    cd hack-the-north-2026 && git apply webxr/bridge/mission-feed.patch
     python3 mission.py --sim local --webxr-feed          # serves the same /positions on :8781
 
 --sim here is for looking at the map without a mission.
@@ -28,6 +28,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import socket
+import socketserver
 import sys
 import threading
 import time
@@ -43,16 +45,19 @@ class Feed:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._assets: dict[str, dict] = {}
+        self._first_seen: dict[str, float] = {}
 
     def update(self, name: str, kind: str, lat: float, lon: float, alt: float) -> None:
         with self._lock:
+            self._first_seen.setdefault(name, time.monotonic())
             self._assets[name] = {"name": name, "kind": kind, "lat": lat, "lon": lon, "alt": alt,
                                   "_seen": time.monotonic()}
 
     def snapshot(self) -> dict:
         now = time.monotonic()
         with self._lock:
-            assets = [{**{k: v for k, v in a.items() if k != "_seen"}, "age": round(now - a["_seen"], 2)}
+            assets = [{**{k: v for k, v in a.items() if k != "_seen"}, "age": round(now - a["_seen"], 2),
+                       "first_seen_age": round(now - self._first_seen[a["name"]], 1)}
                       for a in self._assets.values()]
         return {"t": time.time(), "assets": assets}
 
@@ -77,10 +82,24 @@ def serve(feed: Feed, port: int = DEFAULT_PORT, host: str = "0.0.0.0") -> Thread
         def log_message(self, *args) -> None:  # one line per poll would drown everything else
             pass
 
-    # http.server sets SO_REUSEADDR, which lets macOS bind 0.0.0.0:<port> next to another program's
-    # 127.0.0.1:<port>. Localhost then reaches that program instead of us. Fail loudly instead.
-    ThreadingHTTPServer.allow_reuse_address = False
-    server = ThreadingHTTPServer((host, port), Handler)
+    # Refuse a port another program is listening on. macOS lets a wildcard bind (0.0.0.0) succeed next to
+    # someone else's 127.0.0.1:<port> listener, after which localhost reaches THEM, not us. Address reuse
+    # stays ON (the default): turning it off would also refuse a restart while the last run's connections
+    # sit in TIME_WAIT, which is exactly when you restart the mission.
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.3).close()
+    except OSError:
+        pass  # nothing answered: the port is free
+    else:
+        raise OSError(f"port {port} is already in use by another program; stop it or pick another port")
+    class _Server(ThreadingHTTPServer):
+        def server_bind(self) -> None:
+            # Skip HTTPServer's reverse-DNS lookup of our own address (socket.getfqdn): it can take seconds
+            # on macOS, and mission.py would sit on it at start-up. Nothing here uses the name.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+
+    server = _Server((host, port), Handler)
     threading.Thread(target=server.serve_forever, name="feed-http", daemon=True).start()
     return server
 

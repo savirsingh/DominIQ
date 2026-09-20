@@ -165,10 +165,42 @@ TYPE_MASK_VEL_YAWRATE = 1 | 2 | 4 | 64 | 128 | 256 | 1024
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 MODEL_CONF = 0.25
-MODEL_CONF_TRACK = 0.15   # once a boat is being tracked, accept fainter detections of it than it took to find it
+MODEL_CONF_TRACK = 0.20   # once a boat is being tracked, accept slightly fainter detections of it than it took to find it (0.15 let too much through)
 DETECTION_INTERVAL = 1.5  # seconds between AI inference frames while searching
 TRACK_INTERVAL = 0.5      # seconds between inference passes on the asset that is tracking the boat
 TOWER_FIX_TIMEOUT_S = 40   # how long to wait for a tower to report a real position at startup
+# --- Confirming a boat before anything else is redirected ------------------------------------------
+# The first detection is only a candidate. The asset that saw it engages it (the quad centres it, the plane
+# heads for it) so it stays in view, and it counts as a boat once enough detections that can be placed on the
+# water agree on where it is. The window is generous because the boat flickers in and out of detection.
+CONFIRM_HITS = 4                 # detections that agree...
+CONFIRM_WINDOW_FRAMES = 40       # ...within this many new camera frames (~20-40 s), not necessarily consecutive
+CONFIRM_MAX_S = 45.0             # wall-clock cap, in case frames stop arriving
+CONFIRM_GATE_M = 250             # a hit must lie this close to the earlier hits' mean position
+CONFIRM_MAX_TURN_DEG = 100       # the plane will not turn more than this to engage a candidate (a 122 deg turn stalled it)
+REJECT_MEMORY_S = 180.0          # a candidate that failed is ignored...
+REJECT_RADIUS_M = 300.0          # ...within this distance of where it was, for this long
+# Once tracking, a detection only counts as the boat if it is this close to where the track says it is
+# (plus a growing allowance for each second since it was last seen: it moves). Anything else is a miss.
+TRACK_HIT_GATE_M = {"quadcopter": 300, "fixed-wing": 500}
+TRACK_HIT_GATE_GROW_MS = 5.0
+TRACK_HIT_GATE_GROW_MAX_S = 60.0
+
+# --- Trusting the towers -----------------------------------------------------------------------------
+# A tower call is a timestamped event (state.tower_calls / tower_seq / last_tower) and the newest call wins.
+# The plane swings to the tower that called last, and a new call breaks off a candidate that is still only
+# a single sighting (one with more hits keeps confirming, or noisy towers would make confirming impossible).
+TOWER_RETARGET_MIN_S = 20.0      # the plane will not swing between towers more often than this (a 180 deg turn at 12 m/s risks a stall)
+CONFIRM_TOWER_ABORT_HITS = 2     # a tower call abandons a candidate with fewer hits than this
+QUAD_RESPONDS_TO_TOWERS = True   # the quad goes to a tower that calls and searches around it...
+QUAD_TOWER_RADIUS_M = 250        # ...on a circle this far out...
+QUAD_TOWER_ACTIVE_S = 120.0      # ...until the tower has been quiet this long, then it resumes its lane search
+
+# --- A new lock has to prove itself ------------------------------------------------------------------
+# Confirmation is generous (the boat flickers), so right after it the lock is fragile on purpose: it must
+# collect PROBATION_HITS hits, from any camera, within PROBATION_S of being confirmed, or it is forgotten.
+PROBATION_HITS = 10
+PROBATION_S = 45.0
 BOAT_LOST_FRAMES = 25     # consecutive new frames with no detection before the boat is dropped (~25 s)
 
 # Camera specs read from the sim source (arctic-sim/sim/models). Both are fixed, forward-looking
@@ -201,6 +233,13 @@ class SharedState:
         self.boat_track = BoatTrack()
         self.found_by = None      # the asset that saw it first (for the log): every asset tracks it once found
         self.tracker_misses = {}  # asset -> (consecutive frames without the boat, its limit), for each asset tracking
+        self.rejected = []        # (lat, lon, until) of candidates that failed confirmation: ignored for a while
+        self.tower_seq = 0        # counts tower calls
+        self.last_tower = None    # the tower that called last
+        self.tower_calls = {}     # tower name -> time of its latest call
+        self.locked_at = 0.0      # when the current boat was confirmed (0 = no probation to apply)
+        self.lock_hits = 0        # hits on it since, from any camera
+        self.lock_established = False
         self.boat_lost = False    # set when a tracked boat was dropped, cleared on the next sighting
         self.locked = False
         self.shutdown = False
@@ -485,8 +524,26 @@ class BoatTrack:
 # MAVLink helpers
 # ---------------------------------------------------------------------------
 
+# Optional feed for the WebXR map (webxr/bridge/feed.py). Off unless --webxr-feed is given.
+_WEBXR_FEED = None
+
+
+def _publish_position(name):
+    """pymavlink message hook: each GLOBAL_POSITION_INT this connection receives also goes to the map.
+
+    Hooks run whichever code reads the connection, so the map adds no second MAVLink client.
+    """
+    kind = sim_config.ASSETS[name]["type"]
+
+    def hook(conn, msg):
+        if _WEBXR_FEED is not None and msg.get_type() == "GLOBAL_POSITION_INT":
+            _WEBXR_FEED.update(name, kind, msg.lat / 1e7, msg.lon / 1e7, msg.alt / 1000.0)
+    return hook
+
+
 def connect(name, wait_ekf=False):
     conn = mavutil.mavlink_connection(sim_config.mavlink_url(name), source_system=255)
+    conn.message_hooks.append(_publish_position(name))
     for _ in range(5):
         conn.mav.heartbeat_send(
             mavutil.mavlink.MAV_TYPE_GCS,
@@ -760,13 +817,37 @@ def publish_fix(name, state, lat, lon, info, stamp):
             state.boat_lat, state.boat_lon = lat, lon
 
 
-def scan_for_boat(name, conn, cam, detector, state, pos, tr=None, telem=None):
-    """Run inference on the latest frame; on a hit publish the estimated boat position.
+def pick_detection(name, conn, frame, dets, stamp, telem, near=None, gate=None):
+    """The detection to treat as the boat: the most confident one that can be placed on the water (a detection
+    at or above the horizon cannot be a boat on the sea) and, if `near` is given, lies within `gate` metres of
+    it. Returns (detection, lat, lon, info), or None."""
+    for det in sorted(dets, key=lambda d: -d[0]):
+        _, lat, lon, info = locate_boat(name, conn, frame, [det], stamp, telem)
+        if lat is None:
+            continue
+        if near is not None and dist_between(lat, lon, near[0], near[1]) > gate:
+            continue
+        return det, lat, lon, info
+    return None
 
-    With a `tr` (new_track()), the sighting is recorded in it too, so whoever takes over tracking
-    knows which way to turn from the very first frame. With `telem` (a TelemetryLog) the frame is
-    projected with the pose it was taken in. Returns True if the boat was detected.
-    """
+
+def recently_rejected(state, lat, lon, now=None):
+    """Is this where a candidate already failed confirmation, lately enough to ignore it?"""
+    now = time.time() if now is None else now
+    with state.lock:
+        state.rejected = [r for r in state.rejected if r[2] > now]
+        return any(dist_between(lat, lon, r[0], r[1]) <= REJECT_RADIUS_M for r in state.rejected)
+
+
+_ignore_logged = {}
+
+
+def acquire_boat(name, conn, cam, detector, state, pos, tr, telem=None, resume=None):
+    """Look for the boat on the latest frame. A detection starts a candidate, which is engaged and confirmed
+    (confirm_boat) before anything is committed. Returns True once a boat is found: confirmed by this asset,
+    or by another while this one was confirming. `tr` is a new_track() the sighting is recorded in, so whoever
+    tracks it next knows which way to turn from the first frame. `resume` re-issues this asset's own goto if a
+    candidate was engaged and then rejected (the quad's search loop resends its own every pass)."""
     if detector.model is None:
         return False
     frame, stamp = cam.latest_stamped()
@@ -775,39 +856,218 @@ def scan_for_boat(name, conn, cam, detector, state, pos, tr=None, telem=None):
     dets = detector.detect(frame)
     if not dets:
         return False
-    if tr is not None:
-        note_sighting(name, conn, frame, dets, tr, stamp, telem)
-    conf, lat, lon, info = locate_boat(name, conn, frame, dets, stamp, telem)
-    if lat is None:
-        # Seen, but can't be projected. Keep any earlier estimate; seed with the drone's own
-        # position only if there is none yet so the plane still heads to the right area.
-        log(name, f"BOAT DETECTED conf={conf:.2f} — could not project to ground")
-        with state.lock:
-            if state.boat_found and state.found_by != name:
-                return True                       # another asset already owns the track
-            if not state.boat_found:
-                state.boat_lat, state.boat_lon = pos[0], pos[1]
-                state.found_by = name
-            state.boat_found = True
-            state.boat_lost = False
-        return True
-    log(name, f"BOAT DETECTED conf={conf:.2f} -> ({lat:.5f}, {lon:.5f})")
-    with state.lock:
-        if state.boat_found and state.found_by != name:
+    pick = pick_detection(name, conn, frame, dets, stamp, telem)
+    if pick is None:
+        if time.time() - _ignore_logged.get(name, 0.0) > 10:
+            _ignore_logged[name] = time.time()
+            log(name, "detection ignored: it cannot be placed on the water (at or above the horizon)")
+        return False
+    det, lat, lon, info = pick
+    if recently_rejected(state, lat, lon):
+        return False
+    return confirm_boat(name, conn, cam, detector, state, tr, telem, resume,
+                        first=(frame, det, lat, lon, info, stamp))
+
+
+def _engage(name, conn, state, tr, cand_track, pos, hits, last_goto):
+    """Turn toward the candidate as if engaging it, so it stays in view while it is confirmed. The quad runs the
+    same centring servo it uses on a confirmed boat; the plane heads for the candidate, unless that is behind it."""
+    if name == "quadcopter":
+        follow_boat(conn, tr, cand_track, pos)
+        return last_goto
+    if time.time() - last_goto < 1.0 or not hits:
+        return last_goto
+    tlat, tlon = hits[-1][0], hits[-1][1]
+    att = conn.messages.get("ATTITUDE")
+    if att is not None and abs(wrap_pi(bearing_latlon(pos[:2], (tlat, tlon)) - att.yaw)) > math.radians(CONFIRM_MAX_TURN_DEG):
+        return last_goto
+    plane_goto(name, conn, tlat, tlon, PLANE_PATROL_ALT)
+    return time.time()
+
+
+def confirm_boat(name, conn, cam, detector, state, tr, telem, resume, first):
+    """Engage a candidate and confirm it. Hits are detections that can be placed on the water and lie within
+    CONFIRM_GATE_M of the earlier hits' mean; CONFIRM_HITS of them within CONFIRM_WINDOW_FRAMES new frames
+    (or CONFIRM_MAX_S) confirm it, and only then is boat_found set. Otherwise it is rejected, that spot is
+    ignored for a while, and the caller carries on searching."""
+    frame0, det0, lat, lon, info, stamp = first
+    hits = [(lat, lon, info, stamp, det0[0])]
+    cand_track = BoatTrack()
+    if fix_ok(name, info):
+        cand_track.update(lat, lon, stamp - CAMERA_LATENCY_S, FIX_WEIGHT[name])
+    note_sighting(name, conn, frame0, [det0], tr, stamp, telem)
+    log(name, f"possible boat conf={det0[0]:.2f} at ({lat:.5f}, {lon:.5f}): engaging it to confirm "
+              f"(need {CONFIRM_HITS} hits in {CONFIRM_WINDOW_FRAMES} frames)")
+    frames, seen, start, last_goto = 0, stamp, time.time(), 0.0
+    tower_seq0 = state.tower_seq
+    while frames < CONFIRM_WINDOW_FRAMES and time.time() - start < CONFIRM_MAX_S and not state.shutdown:
+        if state.boat_found:                                  # another asset confirmed it meanwhile
             return True
-        if not state.boat_found:
-            state.found_by = name
+        if state.tower_seq != tower_seq0 and len(hits) < CONFIRM_TOWER_ABORT_HITS:
+            # A tower called while this is still one lone sighting: trust the tower. Not rejected, just left.
+            log(name, f"tower call: leaving the candidate ({len(hits)} hit) to respond")
+            tr.clear()
+            tr.update(new_track())
+            if resume is not None:
+                resume()
+            return False
+        pos = get_position(conn)
+        if pos:
+            with state.lock:
+                state.asset_positions[name] = pos
+            last_goto = _engage(name, conn, state, tr, cand_track, pos, hits, last_goto)
+        new_frame, new_stamp = cam.newest(seen)
+        if new_frame is not None:
+            seen, frames = new_stamp, frames + 1
+            dets = detector.detect(new_frame)
+            if dets:
+                mean = (sum(h[0] for h in hits) / len(hits), sum(h[1] for h in hits) / len(hits))
+                pick = pick_detection(name, conn, new_frame, dets, new_stamp, telem, near=mean, gate=CONFIRM_GATE_M)
+                if pick is not None:
+                    det, lat, lon, info = pick
+                    note_sighting(name, conn, new_frame, [det], tr, new_stamp, telem)
+                    hits.append((lat, lon, info, new_stamp, det[0]))
+                    if fix_ok(name, info):
+                        cand_track.update(lat, lon, new_stamp - CAMERA_LATENCY_S, FIX_WEIGHT[name])
+                    if len(hits) >= CONFIRM_HITS:
+                        return commit_boat(name, state, tr, hits, frames)
+        time.sleep(TRACK_INTERVAL)
+    if state.boat_found:
+        return True
+    mean = (sum(h[0] for h in hits) / len(hits), sum(h[1] for h in hits) / len(hits))
+    with state.lock:
+        state.rejected.append((mean[0], mean[1], time.time() + REJECT_MEMORY_S))
+    log(name, f"not a boat: {len(hits)} agreeing hit(s) in {frames} frames (need {CONFIRM_HITS}); "
+              f"ignoring this spot for {REJECT_MEMORY_S:.0f} s and searching on")
+    tr.clear()
+    tr.update(new_track())                                   # forget where the false candidate sat in the frame
+    if resume is not None:
+        resume()
+    return False
+
+
+def commit_boat(name, state, tr, hits, frames):
+    """The candidate is confirmed: only now does the boat exist for everyone else. The estimate is the mean of
+    the hits, and the hits are replayed into the shared track. Returns True."""
+    lat = sum(h[0] for h in hits) / len(hits)
+    lon = sum(h[1] for h in hits) / len(hits)
+    with state.lock:
+        if state.boat_found:
+            return True                                       # someone else got there first
+        state.found_by = name
         state.boat_found = True
         state.boat_lost = False
-        state.boat_lat = lat                      # the seed, whatever the fix quality
-        state.boat_lon = lon
-    feed_track(name, state, lat, lon, info, stamp)
+        state.boat_lat, state.boat_lon = lat, lon
+        state.locked_at, state.lock_hits, state.lock_established = time.time(), 0, False   # probation starts now
+    tr["hit_at"] = time.time()
+    for h in hits:
+        feed_track(name, state, h[0], h[1], h[2], h[3])
+    log(name, f"BOAT CONFIRMED: {len(hits)} hits in {frames} frames (best conf {max(h[4] for h in hits):.2f}) "
+              f"-> ({lat:.5f}, {lon:.5f})")
     return True
 
 
-def drop_boat(name, state, misses):
-    log(name, f"BOAT LOST — no detection in {misses} frames, resuming search")
+def record_tower_call(state, name, tower_num):
+    """A tower saw motion. The flags stay set (the plane's tower phase and the status line use them); the call
+    is also recorded as a timestamped event so the newest one can win."""
     with state.lock:
+        if tower_num == 1:
+            state.tower1_detected = True
+        else:
+            state.tower2_detected = True
+        state.tower_seq += 1
+        state.last_tower = name
+        state.tower_calls[name] = time.time()
+
+
+def latest_tower_call(state, within=None, now=None):
+    """(tower name, when) of the most recent tower call, or None. With `within` seconds: only if it is that recent."""
+    now = time.time() if now is None else now
+    with state.lock:
+        if state.last_tower is None:
+            return None
+        name, when = state.last_tower, state.tower_calls[state.last_tower]
+    if within is not None and now - when > within:
+        return None
+    return name, when
+
+
+def check_probation(name, state, now=None):
+    """A new lock has to prove itself: PROBATION_HITS hits (from any camera) within PROBATION_S of being
+    confirmed, or it is dropped. Returns True if it dropped the boat."""
+    now = time.time() if now is None else now
+    with state.lock:
+        if not state.boat_found or not state.locked_at or state.lock_established:
+            return False
+        hits = state.lock_hits
+        if hits >= PROBATION_HITS:
+            state.lock_established = True
+            established, expired = True, False
+        else:
+            established, expired = False, now - state.locked_at > PROBATION_S
+    if established:
+        log(name, f"lock established: {hits} hits since it was confirmed")
+        return False
+    if expired:
+        drop_boat(name, state, reason=f"only {hits} hit(s) in {PROBATION_S:.0f} s since it was confirmed "
+                                      f"(a real boat gives {PROBATION_HITS})")
+        return True
+    return False
+
+
+def quad_tower_call(state):
+    """Is there a tower call fresh enough for the quad to respond to?"""
+    return QUAD_RESPONDS_TO_TOWERS and latest_tower_call(state, within=QUAD_TOWER_ACTIVE_S) is not None
+
+
+def tower_circle(centre, radius_m, n=8):
+    """Corners of a circle around a tower as (lat, lon, heading rad), the heading being the leg leaving each corner."""
+    pts = generate_circle_waypoints(centre[0], centre[1], radius_m, n)
+    return [(la, lo, bearing_latlon((la, lo), pts[(i + 1) % n])) for i, (la, lo) in enumerate(pts)]
+
+
+def quad_tower_search(name, conn, cam, detector, state, scan_tr, telem):
+    """A tower called: fly to it and search around it on a circle, while the call is fresh (QUAD_TOWER_ACTIVE_S
+    after the tower's latest call). The newest call wins: if a different tower calls, go there. Returns when the
+    towers have been quiet (the caller resumes the lane search where it stopped), when a boat is found, or on
+    shutdown."""
+    last_detect, tname, corners, k = 0.0, None, [], 0
+    while not state.shutdown and not state.boat_found:
+        call = latest_tower_call(state, within=QUAD_TOWER_ACTIVE_S)
+        if call is None:
+            log(name, "towers quiet: back to the lane search")
+            return
+        pos = get_position(conn)
+        if not pos:
+            time.sleep(0.2)
+            continue
+        with state.lock:
+            state.asset_positions[name] = pos
+        if call[0] != tname:                                    # the first call, or a different tower called last
+            tname = call[0]
+            corners = tower_circle(TOWER_POSITIONS[tname], QUAD_TOWER_RADIUS_M)
+            k = min(range(len(corners)), key=lambda i: dist_between(pos[0], pos[1], corners[i][0], corners[i][1]))
+            log(name, f"TOWER {tname} called: going to search around it ({QUAD_TOWER_RADIUS_M} m circle)")
+        wlat, wlon, leg_yaw = corners[k]
+        # far from the corner: nose the way we are actually going; on the circle: along the leg
+        yaw = bearing_latlon(pos[:2], (wlat, wlon)) if dist_between(pos[0], pos[1], wlat, wlon) > 150 else leg_yaw
+        send_goto(conn, wlat, wlon, QUAD_PATROL_ALT, yaw)
+        if time.time() - last_detect > DETECTION_INTERVAL:
+            last_detect = time.time()
+            if acquire_boat(name, conn, cam, detector, state, pos, scan_tr, telem):
+                return
+        if dist_between(pos[0], pos[1], wlat, wlon) < QUAD_REACH_M:
+            k = (k + 1) % len(corners)
+        time.sleep(0.2)
+
+
+def drop_boat(name, state, misses=None, reason=None):
+    if reason:
+        log(name, f"BOAT LOST — {reason}, resuming search")
+    else:
+        log(name, f"BOAT LOST — no detection in {misses} frames, resuming search")
+    with state.lock:
+        state.locked_at, state.lock_hits, state.lock_established = 0.0, 0, False
         state.boat_found = False
         state.locked = False
         state.boat_lost = True
@@ -1022,21 +1282,31 @@ def track_boat(name, conn, cam, detector, state, tr, telem=None):
     """
     if detector.model is None:
         return
+    if check_probation(name, state):                         # a new lock that has not proved itself is forgotten
+        return
     frame, tr["stamp"] = cam.newest(tr["stamp"])
     if frame is None:
         return
     dets = detector.detect(frame, conf=MODEL_CONF_TRACK)
     limit = BOAT_LOST_FRAMES_PLANE if name == "fixed-wing" else BOAT_LOST_FRAMES
+    pick = None
     if dets:
+        # Only a detection near where the track says the boat is counts as the boat: a boat-shaped thing
+        # elsewhere (or one that cannot be placed on the water) is a miss, so a false object cannot hold the lock.
+        age = min(time.time() - tr["hit_at"], TRACK_HIT_GATE_GROW_MAX_S) if tr.get("hit_at") else 0.0
+        pick = pick_detection(name, conn, frame, dets, tr["stamp"], telem, near=boat_estimate(state),
+                              gate=TRACK_HIT_GATE_M[name] + TRACK_HIT_GATE_GROW_MS * age)
+    if pick is not None:
+        det, lat, lon, info = pick
         if tr["misses"]:
             log(name, f"boat reacquired after {tr['misses']} missed frames")
         tr["misses"] = 0
+        tr["hit_at"] = time.time()
         with state.lock:
             state.tracker_misses[name] = (0, limit)
-        note_sighting(name, conn, frame, dets, tr, tr["stamp"], telem)
-        conf, lat, lon, info = locate_boat(name, conn, frame, dets, tr["stamp"], telem)
-        if lat is not None:                       # seen but unprojectable keeps the last estimate
-            publish_fix(name, state, lat, lon, info, tr["stamp"])
+            state.lock_hits += 1
+        note_sighting(name, conn, frame, [det], tr, tr["stamp"], telem)
+        publish_fix(name, state, lat, lon, info, tr["stamp"])
         return
     tr["misses"] += 1
     with state.lock:
@@ -1210,6 +1480,11 @@ def run_quadcopter(state, detector):
                 scan_tr = new_track()                           # the next boat starts from a clean record
                 continue
 
+            # A tower called, recently enough: go and search around it, then pick the lane search back up.
+            if quad_tower_call(state):
+                quad_tower_search(name, conn, cam, detector, state, scan_tr, telem)
+                continue
+
             if n >= len(legs):
                 log(name, "grid complete — returning to launch")
                 set_mode(conn, COPTER_RTL_MODE)
@@ -1217,7 +1492,7 @@ def run_quadcopter(state, detector):
                 return
 
             wlat, wlon, yaw = legs[n]
-            while not state.shutdown and not state.boat_found:
+            while not state.shutdown and not state.boat_found and not quad_tower_call(state):
                 send_goto(conn, wlat, wlon, QUAD_PATROL_ALT, yaw)
                 pos = get_position(conn)
                 if not pos:
@@ -1229,7 +1504,7 @@ def run_quadcopter(state, detector):
                 # Keep checking camera while flying
                 if time.time() - last_detect > DETECTION_INTERVAL:
                     last_detect = time.time()
-                    if scan_for_boat(name, conn, cam, detector, state, pos, scan_tr, telem):
+                    if acquire_boat(name, conn, cam, detector, state, pos, scan_tr, telem):
                         break
 
                 if dist_between(pos[0], pos[1], wlat, wlon) < QUAD_REACH_M:
@@ -1320,6 +1595,7 @@ def run_fixed_wing(state, detector):
 
         cam = CameraStream(sim_config.camera_url(name))
         last_detect = 0
+        plane_scan_tr = new_track()                  # where a candidate sat in the frame while it was being confirmed
 
         while not state.shutdown:
             # --- Phase 3: boat found → lock on and follow ---
@@ -1351,20 +1627,23 @@ def run_fixed_wing(state, detector):
 
             # --- Phase 2: tower detected motion → rush to that area ---
             if state.tower1_detected or state.tower2_detected:
-                if state.tower1_detected:
-                    target = TOWER_POSITIONS["tower-1"]
-                    tname = "tower-1"
-                else:
-                    target = TOWER_POSITIONS["tower-2"]
-                    tname = "tower-2"
+                tname = state.last_tower or ("tower-1" if state.tower1_detected else "tower-2")
+                target = TOWER_POSITIONS[tname]
 
                 log(name, f"TOWER {tname} detected motion — orbiting it at {PLANE_TOWER_ORBIT_RADIUS_M} m")
                 # One DO_REPOSITION with a loiter radius: the autopilot flies onto a circle around the tower and
                 # follows it at a steady, shallow bank. This replaces an 8-waypoint ring that made the plane
                 # turn ~120 degrees at each waypoint at ~12 m/s, which stalled it.
-                last_sent = 0.0
+                last_sent, last_retarget = 0.0, time.time()
                 while (state.tower1_detected or state.tower2_detected) \
                         and not state.boat_found and not state.shutdown:
+                    # The newest call wins: swing to the tower that called last (not more often than
+                    # TOWER_RETARGET_MIN_S: a 180 degree turn at 12 m/s is a stall risk).
+                    if (state.last_tower and state.last_tower != tname
+                            and time.time() - last_retarget >= TOWER_RETARGET_MIN_S):
+                        tname, last_retarget, last_sent = state.last_tower, time.time(), 0.0
+                        target = TOWER_POSITIONS[tname]
+                        log(name, f"TOWER {tname} detected motion — now orbiting it at {PLANE_TOWER_ORBIT_RADIUS_M} m")
                     if time.time() - last_sent > 15:            # the target sticks, but say it again in case one was lost
                         last_sent = time.time()
                         plane_goto(name, conn, target[0], target[1], PLANE_PATROL_ALT,
@@ -1379,7 +1658,9 @@ def run_fixed_wing(state, detector):
                     # Check camera while searching
                     if time.time() - last_detect > DETECTION_INTERVAL:
                         last_detect = time.time()
-                        if scan_for_boat(name, conn, cam, detector, state, pos, telem=telem):
+                        if acquire_boat(name, conn, cam, detector, state, pos, plane_scan_tr, telem,
+                                        resume=lambda: plane_goto(name, conn, target[0], target[1], PLANE_PATROL_ALT,
+                                                                  radius=PLANE_TOWER_ORBIT_RADIUS_M)):
                             break
                     time.sleep(1)
                 continue
@@ -1400,7 +1681,8 @@ def run_fixed_wing(state, detector):
 
                 if time.time() - last_detect > DETECTION_INTERVAL:
                     last_detect = time.time()
-                    if scan_for_boat(name, conn, cam, detector, state, pos, telem=telem):
+                    if acquire_boat(name, conn, cam, detector, state, pos, plane_scan_tr, telem,
+                                    resume=lambda: plane_goto(name, conn, wlat, wlon, PLANE_PATROL_ALT)):
                         break
 
                 d = dist_between(pos[0], pos[1], wlat, wlon)
@@ -1508,11 +1790,7 @@ def run_tower(name, state, marked):
                 if img is not None:
                     for fname, bearing, elev, t in watcher.process(img, tower.yaw, tower.pitch):
                         log(name, "MOTION DETECTED! " + describe(t, bearing, elev, fname))
-                        with state.lock:
-                            if tower_num == 1:
-                                state.tower1_detected = True
-                            else:
-                                state.tower2_detected = True
+                        record_tower_call(state, name, tower_num)
                 if not watcher.learning and not announced:
                     log(name, "watching for movement")
                     announced = True
@@ -1615,14 +1893,35 @@ def discover_tower_positions():
     return found
 
 
+def publish_boat(state):
+    """Send the filtered boat position to the WebXR map. Silent while no boat is tracked, so its pin fades."""
+    while not state.shutdown:
+        if state.boat_found:
+            tracked = state.boat_track.position(time.time())
+            lat, lon = tracked if tracked else (state.boat_lat, state.boat_lon)
+            if lat or lon:
+                _WEBXR_FEED.update("boat", "boat", lat, lon, 0.0)
+        time.sleep(0.5)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Coordinated drone mission for Arctic SIM-8")
     sim_config.add_argument(parser)
     parser.add_argument("--tower-config", default=AIM_FILE,
                         help="tower_aim.json holding the sweep ranges marked with tower_aim.py "
                              f"(default: {AIM_FILE})")
+    parser.add_argument("--webxr-feed", nargs="?", const=8781, type=int, metavar="PORT",
+                        help="serve asset and boat positions to the WebXR map on this port (default 8781)")
     args = parser.parse_args()
     sim_config.configure(args)
+
+    if args.webxr_feed:
+        global _WEBXR_FEED
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "webxr", "bridge"))
+        import feed as webxr_feed
+        _WEBXR_FEED = webxr_feed.Feed()
+        webxr_feed.serve(_WEBXR_FEED, args.webxr_feed)
+        print(f"WebXR map feed on http://0.0.0.0:{args.webxr_feed}/positions")
 
     print("=" * 60)
     print("ARCTIC SIM-8 — COORDINATED MISSION")
@@ -1656,6 +1955,8 @@ def main():
         threading.Thread(target=run_tower, args=("tower-2", state, tower_ranges["tower-2"]), name="tower-2"),
         threading.Thread(target=status_printer, args=(state,), name="status"),
     ]
+    if _WEBXR_FEED is not None:
+        threads.append(threading.Thread(target=publish_boat, args=(state,), name="webxr-boat"))
 
     for t in threads:
         t.daemon = True

@@ -1,0 +1,3 @@
+[submodule "arctic-sim"]
+	path = arctic-sim
+	url = https://github.com/Karan-Gupta07/arctic-sim

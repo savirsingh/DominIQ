@@ -29,7 +29,7 @@
   }
 </style>
 
-<div class="callout" anchor-y="bottom">
+<div id="callout" class="callout" anchor-y="bottom">
   <p id="orb-name" class="name">NAME</p>
   <div class="rule"></div>
   <p id="orb-description" class="description">Description</p>

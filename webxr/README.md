@@ -36,3 +36,9 @@ The in-world **Room settings** panel is the official IWSDK UIKitML Horizon kit. 
 ## Speech transcription
 
 The in-world panel can show what you said. Set `VITE_ELEVENLABS_API_KEY` in `.env`, restart Vite, press **Speak** in the panel, talk, then press it again to stop. The recording is transcribed by ElevenLabs and the text appears in the panel. Speech is only displayed; it does not trigger any actions. The key is sent from the browser directly to ElevenLabs; use a restricted development key for this prototype.
+
+## Voice assistant
+
+Hold **B** (right controller) or **Y** (left), ask about the mission, release. The answer is spoken and
+captioned. It needs the assistant service running; see `../assistant/README.md`. Cameras for locked assets
+proxy through `/cam/<asset>` and the assistant through `/ask` (both in `vite.config.ts`).

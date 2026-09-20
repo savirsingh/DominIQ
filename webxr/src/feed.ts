@@ -9,6 +9,8 @@ export interface FeedAsset {
   alt: number;
   /** Seconds since the bridge last heard from this asset. */
   age: number;
+  /** Seconds since the bridge first heard from it. Lets the page tell a fresh sighting from an old one. */
+  first_seen_age?: number;
 }
 
 export type FeedStatus = 'connecting' | 'live' | 'offline';
