@@ -1,0 +1,9 @@
+<meta preferred-color-scheme="dark" />
+
+<Panel width="420" flex-direction="column" align-items="center" gap="12" padding="16" color="white">
+  <h3 id="placement-message">Place the map using the index trigger</h3>
+  <div id="placement-actions" display="none" flex-direction="row" gap="12">
+    <Button id="undo-map" variant="secondary">Undo</Button>
+    <Button id="confirm-map" variant="primary">Confirm</Button>
+  </div>
+</Panel>

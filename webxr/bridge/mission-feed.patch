@@ -1,0 +1,74 @@
+--- a/mission.py
++++ b/mission.py
+@@ -485,8 +485,26 @@
+ # MAVLink helpers
+ # ---------------------------------------------------------------------------
+ 
++# Optional feed for the WebXR map (webxr/bridge/feed.py). Off unless --webxr-feed is given.
++_WEBXR_FEED = None
++
++
++def _publish_position(name):
++    """pymavlink message hook: each GLOBAL_POSITION_INT this connection receives also goes to the map.
++
++    Hooks run whichever code reads the connection, so the map adds no second MAVLink client.
++    """
++    kind = sim_config.ASSETS[name]["type"]
++
++    def hook(conn, msg):
++        if _WEBXR_FEED is not None and msg.get_type() == "GLOBAL_POSITION_INT":
++            _WEBXR_FEED.update(name, kind, msg.lat / 1e7, msg.lon / 1e7, msg.alt / 1000.0)
++    return hook
++
++
+ def connect(name, wait_ekf=False):
+     conn = mavutil.mavlink_connection(sim_config.mavlink_url(name), source_system=255)
++    conn.message_hooks.append(_publish_position(name))
+     for _ in range(5):
+         conn.mav.heartbeat_send(
+             mavutil.mavlink.MAV_TYPE_GCS,
+@@ -1615,14 +1633,35 @@
+     return found
+ 
+ 
++def publish_boat(state):
++    """Send the filtered boat position to the WebXR map. Silent while no boat is tracked, so its pin fades."""
++    while not state.shutdown:
++        if state.boat_found:
++            tracked = state.boat_track.position(time.time())
++            lat, lon = tracked if tracked else (state.boat_lat, state.boat_lon)
++            if lat or lon:
++                _WEBXR_FEED.update("boat", "boat", lat, lon, 0.0)
++        time.sleep(0.5)
++
++
+ def main():
+     parser = argparse.ArgumentParser(description="Coordinated drone mission for Arctic SIM-8")
+     sim_config.add_argument(parser)
+     parser.add_argument("--tower-config", default=AIM_FILE,
+                         help="tower_aim.json holding the sweep ranges marked with tower_aim.py "
+                              f"(default: {AIM_FILE})")
++    parser.add_argument("--webxr-feed", nargs="?", const=8781, type=int, metavar="PORT",
++                        help="serve asset and boat positions to the WebXR map on this port (default 8781)")
+     args = parser.parse_args()
+     sim_config.configure(args)
++
++    if args.webxr_feed:
++        global _WEBXR_FEED
++        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "webxr", "bridge"))
++        import feed as webxr_feed
++        _WEBXR_FEED = webxr_feed.Feed()
++        webxr_feed.serve(_WEBXR_FEED, args.webxr_feed)
++        print(f"WebXR map feed on http://0.0.0.0:{args.webxr_feed}/positions")
+ 
+     print("=" * 60)
+     print("ARCTIC SIM-8 — COORDINATED MISSION")
+@@ -1656,6 +1695,8 @@
+         threading.Thread(target=run_tower, args=("tower-2", state, tower_ranges["tower-2"]), name="tower-2"),
+         threading.Thread(target=status_printer, args=(state,), name="status"),
+     ]
++    if _WEBXR_FEED is not None:
++        threads.append(threading.Thread(target=publish_boat, args=(state,), name="webxr-boat"))
+ 
+     for t in threads:
+         t.daemon = True

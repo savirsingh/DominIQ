@@ -1,0 +1,12 @@
+<meta preferred-color-scheme="dark" />
+
+<Panel width="360" flex-direction="column" gap="12" padding="20" color="white">
+  <h2>Room settings</h2>
+  <p>Start AR, then place the map on a real surface.</p>
+  <Button id="enter-ar" variant="primary">Start AR</Button>
+  <Button id="rescan-room" variant="secondary">Re-scan room</Button>
+  <Button id="speak" variant="secondary">Speak</Button>
+  <p id="speech-status">Press Speak and talk</p>
+  <p id="transcript">Your transcript will appear here</p>
+  <Button id="close-settings" variant="tertiary">Close</Button>
+</Panel>

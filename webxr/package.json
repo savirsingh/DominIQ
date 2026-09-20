@@ -1,0 +1,20 @@
+{
+  "name": "quest-3-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@iwsdk/core": "^0.5.3"
+  },
+  "devDependencies": {
+    "@iwsdk/vite-plugin-dev": "^0.5.3",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.7"
+  }
+}

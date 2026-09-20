@@ -1,0 +1,27 @@
+{
+  "name": "fort_ross",
+  "location": {
+    "lat": 71.99196,
+    "lon": -94.822428
+  },
+  "convergence_deg": -49.80479318596525,
+  "grid": 1025,
+  "extent_m": 6500.0,
+  "spacing_m": 6.34765625,
+  "scale_factor": 0.9942017601469602,
+  "true_scale": true,
+  "bounds_3413": {
+    "xmin": -1505608.044159686,
+    "ymin": -1271830.812646156,
+    "xmax": -1499139.421867714,
+    "ymax": -1265362.190354184
+  },
+  "elevation_m": {
+    "min": 0.0,
+    "max": 252.109,
+    "range": 252.109,
+    "mean": 83.446,
+    "stddev": 76.602
+  },
+  "heightmap_bits": 8
+}
