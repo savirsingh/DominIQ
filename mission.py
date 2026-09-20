@@ -2,20 +2,16 @@
 """
 Coordinated drone mission controller for Arctic SIM-8.
 
-Orchestrates all 4 assets with AI-powered boat detection:
-  - Quadcopter + fixed-wing: take off and circle on patrol
-  - Tower-1 + tower-2: background-subtraction motion detection
-  - When a tower detects motion → fixed-wing rushes to that area
-  - When AI detects the boat → fixed-wing locks on and follows it
+All 4 assets patrol and scan for the boat using YOLO. When any camera
+spots the boat, its GPS coords are estimated from the camera geometry,
+and both drones converge on it.
 
-Usage:
-    python3 mission.py
-
-Press Ctrl+C to land all drones and shut down.
+Usage:  python3 mission.py
+Stop:   Ctrl+C (lands both drones)
 """
 
 from pymavlink import mavutil
-from tracker import estimate_boat_position, haversine, offset_lat_lon
+from tracker import offset_lat_lon
 import threading
 import math
 import time
@@ -31,800 +27,561 @@ import numpy as np
 SIM_HOST = "10.99.7.1"
 
 ASSETS = {
-    "quadcopter": {"udp": 14550, "type": "copter", "guided_mode": 4},
-    "fixed-wing": {"udp": 14560, "type": "plane",  "guided_mode": 15},
-    "tower-1":    {"udp": 14580, "type": "tower",  "guided_mode": None},
-    "tower-2":    {"udp": 14590, "type": "tower",  "guided_mode": None},
+    "quadcopter": {"udp": 14550, "guided_mode": 4,  "is_plane": False},
+    "fixed-wing": {"udp": 14560, "guided_mode": 15, "is_plane": True},
 }
 
-CAMERA_URLS = {
-    "quadcopter": f"http://{SIM_HOST}:8600/stream",
-    "fixed-wing": f"http://{SIM_HOST}:8610/stream",
-    "tower-1":    f"http://{SIM_HOST}:8630/stream",
-    "tower-2":    f"http://{SIM_HOST}:8640/stream",
+TOWER_CAMS = {
+    "tower-1": {"udp": 14580, "cam": f"http://{SIM_HOST}:8630/stream",
+                "width": 1280, "height": 720, "hfov": 1.047},
+    "tower-2": {"udp": 14590, "cam": f"http://{SIM_HOST}:8640/stream",
+                "width": 1280, "height": 720, "hfov": 1.047},
+}
+
+DRONE_CAMS = {
+    "quadcopter": {"cam": f"http://{SIM_HOST}:8600/stream",
+                   "width": 960, "height": 720, "hfov": 2.0, "mount_pitch": 0.0},
+    "fixed-wing": {"cam": f"http://{SIM_HOST}:8610/stream",
+                   "width": 1280, "height": 720, "hfov": 1.204, "mount_pitch": 0.14},
 }
 
 SITE_CENTER = (71.99196, -94.822428)
 
-TOWER_POSITIONS = {
-    "tower-1": (71.980671, -94.853711),
-    "tower-2": (72.011778, -94.804721),
-}
-
-QUAD_PATROL_RADIUS_M = 1800
-QUAD_PATROL_ALT = 60
-QUAD_PATROL_WAYPOINTS = 16
-
-PLANE_PATROL_RADIUS_M = 2800
-PLANE_PATROL_ALT = 80
-PLANE_PATROL_WAYPOINTS = 16
-
-WAYPOINT_ARRIVAL_THRESHOLD_M = 30
-
-EARTH_RADIUS = 6_371_000
+QUAD_RADIUS = 1800
+QUAD_ALT = 60
+PLANE_RADIUS = 2800
+PLANE_ALT = 80
+N_WAYPOINTS = 16
+ARRIVAL_M = 30
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt")
 MODEL_CONF = 0.25
-DETECTION_INTERVAL = 1.5  # seconds between AI inference frames
-
-# Camera specs from the SIM models
-CAMERAS = {
-    "quadcopter": {"width": 960, "height": 720, "hfov": 2.0, "mount_pitch": 0.0},
-    "fixed-wing": {"width": 1280, "height": 720, "hfov": 1.204, "mount_pitch": 0.14},
-}
-
-# ---------------------------------------------------------------------------
-# Camera-based boat position estimation
-# ---------------------------------------------------------------------------
-
-def bbox_to_boat_coords(bbox, drone_lat, drone_lon, drone_alt, heading_deg, pitch_deg, cam_name):
-    """Estimate boat GPS from a YOLO bounding box + drone telemetry.
-
-    bbox: (x, y, w, h) in pixels — the detection box
-    Returns (lat, lon) or None if geometry doesn't work.
-    """
-    cam = CAMERAS.get(cam_name)
-    if not cam or drone_alt < 2:
-        return None
-
-    bx, by, bw, bh = bbox
-    cx = bx + bw / 2
-    cy = by + bh / 2
-
-    img_w, img_h = cam["width"], cam["height"]
-    focal_px = (img_w / 2) / math.tan(cam["hfov"] / 2)
-
-    az_offset = math.atan2(cx - img_w / 2, focal_px)
-    el_offset = math.atan2(img_h / 2 - cy, focal_px)
-
-    body_pitch_rad = math.radians(pitch_deg)
-    cam_pitch = body_pitch_rad - cam["mount_pitch"]
-    look_down = -(cam_pitch + el_offset)
-
-    if look_down <= 0.01:
-        return None
-
-    ground_dist = drone_alt / math.tan(look_down)
-    if ground_dist > 5000 or ground_dist < 0:
-        return None
-
-    bearing_rad = math.radians(heading_deg) + az_offset
-
-    boat_lat, boat_lon = offset_lat_lon(drone_lat, drone_lon, ground_dist, bearing_rad)
-    return boat_lat, boat_lon
 
 # ---------------------------------------------------------------------------
 # Shared state
 # ---------------------------------------------------------------------------
 
-class SharedState:
+class State:
     def __init__(self):
         self.lock = threading.Lock()
-        self.tower1_detected = False
-        self.tower2_detected = False
-        self.tower_bearing = None
         self.boat_found = False
         self.boat_lat = 0.0
         self.boat_lon = 0.0
-        self.locked = False
         self.shutdown = False
-        self.asset_positions = {}
-        self.asset_attitudes = {}  # {name: (heading_deg, pitch_deg)}
+        self.positions = {}   # name → (lat, lon, alt)
+        self.attitudes = {}   # name → (heading_deg, pitch_deg)
 
 # ---------------------------------------------------------------------------
-# YOLO boat detector
+# Logging
 # ---------------------------------------------------------------------------
 
-class BoatDetector:
-    """Wraps the trained YOLO model for boat detection on camera frames."""
+_log_lock = threading.Lock()
 
-    def __init__(self, model_path, conf=0.25):
-        self.model = None
-        self.conf = conf
+def log(src, msg):
+    with _log_lock:
+        print(f"[{time.strftime('%H:%M:%S')}] [{src:12s}] {msg}")
+
+# ---------------------------------------------------------------------------
+# YOLO detector
+# ---------------------------------------------------------------------------
+
+_detector = None
+
+def get_detector():
+    global _detector
+    if _detector is None:
         try:
             from ultralytics import YOLO
-            if os.path.exists(model_path):
-                self.model = YOLO(model_path)
-                log("detector", f"YOLO model loaded: {model_path}")
+            if os.path.exists(MODEL_PATH):
+                _detector = YOLO(MODEL_PATH)
+                log("detector", f"loaded {MODEL_PATH}")
             else:
-                log("detector", f"model not found at {model_path} — detection disabled")
+                log("detector", f"model not found: {MODEL_PATH}")
         except ImportError:
-            log("detector", "ultralytics not installed — detection disabled")
+            log("detector", "ultralytics not installed")
+    return _detector
 
-    def detect(self, img):
-        """Returns list of (confidence, (x, y, w, h)) for detected boats."""
-        if self.model is None:
-            return []
-        results = self.model(img, conf=self.conf, verbose=False)
-        detections = []
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                conf = float(box.conf[0])
-                detections.append((conf, (int(x1), int(y1), int(x2 - x1), int(y2 - y1))))
-        return detections
 
-    def detect_and_locate(self, img, drone_lat, drone_lon, drone_alt, heading_deg, pitch_deg, cam_name):
-        """Detect boat AND estimate its GPS coords from the camera geometry.
-        Returns (confidence, boat_lat, boat_lon) or None."""
-        dets = self.detect(img)
-        if not dets:
-            return None
-        best_conf, best_bbox = dets[0]
-        coords = bbox_to_boat_coords(best_bbox, drone_lat, drone_lon, drone_alt, heading_deg, pitch_deg, cam_name)
-        if coords is None:
-            return None
-        return (best_conf, coords[0], coords[1])
+def yolo_detect(img, conf=MODEL_CONF):
+    model = get_detector()
+    if model is None:
+        return []
+    results = model(img, conf=conf, verbose=False)
+    dets = []
+    for r in results:
+        for box in r.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            c = float(box.conf[0])
+            dets.append((c, int(x1), int(y1), int(x2 - x1), int(y2 - y1)))
+    return dets
 
 # ---------------------------------------------------------------------------
-# Camera frame reader (adapted from teammate's tower_watch.Camera)
+# Camera geometry: bbox pixel → boat GPS
 # ---------------------------------------------------------------------------
 
-class CameraStream:
-    """Threaded MJPEG reader — grabs the latest frame from a SIM camera."""
+def bbox_to_gps(cx_px, cy_px, drone_lat, drone_lon, drone_alt,
+                heading_deg, pitch_deg, cam):
+    """Convert a detection's center pixel to a GPS coordinate."""
+    if drone_alt < 2:
+        return None
+    focal = (cam["width"] / 2) / math.tan(cam["hfov"] / 2)
+    az = math.atan2(cx_px - cam["width"] / 2, focal)
+    el = math.atan2(cam["height"] / 2 - cy_px, focal)
+    mount = cam.get("mount_pitch", 0.0)
+    look_down = -(math.radians(pitch_deg) - mount + el)
+    if look_down < 0.02:
+        return None
+    dist = drone_alt / math.tan(look_down)
+    if dist < 0 or dist > 5000:
+        return None
+    bearing = math.radians(heading_deg) + az
+    return offset_lat_lon(drone_lat, drone_lon, dist, bearing)
 
+# ---------------------------------------------------------------------------
+# Camera frame grabber (non-blocking, runs in a thread)
+# ---------------------------------------------------------------------------
+
+class Cam:
     def __init__(self, url):
         self.url = url
         self._frame = None
-        self._stamp = 0.0
         self._lock = threading.Lock()
-        threading.Thread(target=self._run, daemon=True).start()
+        t = threading.Thread(target=self._loop, daemon=True)
+        t.start()
 
-    def _run(self):
+    def _loop(self):
         while True:
             try:
                 cap = cv2.VideoCapture(self.url)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 while cap.isOpened():
                     ok, frame = cap.read()
                     if not ok:
                         break
                     with self._lock:
                         self._frame = frame
-                        self._stamp = time.time()
                 cap.release()
             except Exception:
                 pass
-            time.sleep(1)
+            time.sleep(2)
 
-    def latest(self, max_age=3.0):
+    def grab(self):
         with self._lock:
-            if self._frame is not None and time.time() - self._stamp <= max_age:
-                return self._frame.copy()
-        return None
-
-# ---------------------------------------------------------------------------
-# Tower motion detector (uses teammate's background subtraction approach)
-# ---------------------------------------------------------------------------
-
-class TowerWatcher:
-    """Background-subtraction motion detector for a fixed tower camera."""
-
-    def __init__(self, learn_seconds=30, sensitivity=16, min_area=30, max_area=4000, persist=8):
-        self.bg = cv2.createBackgroundSubtractorMOG2(
-            history=500, varThreshold=sensitivity, detectShadows=False)
-        self.learn_time = learn_seconds
-        self.min_area = min_area
-        self.max_area = max_area
-        self.persist = persist
-        self.rate = 0.0005
-        self.started = time.time()
-        self.tracks = []
-        self.looks = 0
-
-    @property
-    def learning(self):
-        return time.time() - self.started < self.learn_time
-
-    def process(self, img):
-        """Feed one frame. Returns True if persistent motion detected."""
-        is_learning = self.learning
-        lr = 0.05 if is_learning else self.rate
-        mask = self.bg.apply(cv2.GaussianBlur(img, (3, 3), 0), learningRate=lr)
-        if is_learning:
-            return False
-
-        mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)[1]
-        mask = cv2.dilate(mask, np.ones((5, 5), np.uint8))
-        n, _, stats, cents = cv2.connectedComponentsWithStats(mask)
-
-        blobs = []
-        for i in range(1, n):
-            area = stats[i][cv2.CC_STAT_AREA]
-            if self.min_area <= area <= self.max_area:
-                blobs.append((cents[i][0], cents[i][1]))
-
-        now = time.time()
-        for bx, by in blobs:
-            matched = False
-            for t in self.tracks:
-                if math.hypot(t["x"] - bx, t["y"] - by) < 25:
-                    t.update(x=bx, y=by, hits=t["hits"] + 1, last=now)
-                    matched = True
-                    break
-            if not matched:
-                self.tracks.append({"x": bx, "y": by, "hits": 1, "last": now, "alerted": False})
-
-        self.tracks = [t for t in self.tracks if now - t["last"] <= 3.0]
-        self.looks += 1
-
-        for t in self.tracks:
-            if t["hits"] >= self.persist and not t["alerted"]:
-                t["alerted"] = True
-                return True
-        return False
+            return self._frame.copy() if self._frame is not None else None
 
 # ---------------------------------------------------------------------------
 # MAVLink helpers
 # ---------------------------------------------------------------------------
 
-def connect(name, wait_ekf=False):
-    info = ASSETS[name]
-    addr = f"udpout:{SIM_HOST}:{info['udp']}"
+def mav_connect(name, udp_port, wait_ekf=False):
+    addr = f"udpout:{SIM_HOST}:{udp_port}"
     conn = mavutil.mavlink_connection(addr, source_system=255)
     for _ in range(5):
-        conn.mav.heartbeat_send(
-            mavutil.mavlink.MAV_TYPE_GCS,
-            mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
         time.sleep(0.2)
-    conn.mav.request_data_stream_send(
-        0, 0, mavutil.mavlink.MAV_DATA_STREAM_ALL, 4, 1)
-    msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=5)
-    if not msg:
-        raise ConnectionError(f"No heartbeat from {name}")
+    conn.mav.request_data_stream_send(0, 0, mavutil.mavlink.MAV_DATA_STREAM_ALL, 4, 1)
+    conn.recv_match(type="HEARTBEAT", blocking=True, timeout=5)
     if wait_ekf:
         log(name, "waiting for EKF...")
-        start = time.time()
-        while time.time() - start < 40:
-            conn.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GCS,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        t0 = time.time()
+        while time.time() - t0 < 40:
+            conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
             m = conn.recv_match(blocking=True, timeout=1)
             if m and m.get_type() == "EKF_STATUS_REPORT" and m.flags & 0x1F == 0x1F:
-                log(name, f"EKF ready ({time.time()-start:.0f}s)")
+                log(name, f"EKF ready ({time.time()-t0:.0f}s)")
                 return conn
-        log(name, "EKF wait timed out, proceeding anyway")
+        log(name, "EKF timeout, proceeding")
     return conn
 
 
-def heartbeat_loop(conn, state):
+def mav_heartbeat(conn, state):
     while not state.shutdown:
         try:
-            conn.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GCS,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
         except Exception:
             break
         time.sleep(1)
 
 
-def set_mode(conn, mode_id):
-    conn.mav.set_mode_send(
-        conn.target_system,
-        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        mode_id)
-    # Drain until we see the mode change or timeout
-    deadline = time.time() + 3
-    while time.time() < deadline:
-        msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
-        if msg and msg.custom_mode == mode_id:
-            return
-        conn.mav.heartbeat_send(
-            mavutil.mavlink.MAV_TYPE_GCS,
-            mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-    time.sleep(0.5)
+def mav_set_mode(conn, mode):
+    conn.mav.set_mode_send(conn.target_system,
+                           mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode)
+    t0 = time.time()
+    while time.time() - t0 < 3:
+        conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        m = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+        if m and m.custom_mode == mode:
+            return True
+    return False
 
 
-def arm(conn):
-    for attempt in range(5):
-        conn.mav.command_long_send(
-            conn.target_system, conn.target_component,
-            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
-            0, 1, 0, 0, 0, 0, 0, 0)
-        deadline = time.time() + 4
-        while time.time() < deadline:
-            conn.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GCS,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-            msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
-            if msg and msg.base_mode & 128:
+def mav_arm(conn, name):
+    for _ in range(5):
+        conn.mav.command_long_send(conn.target_system, conn.target_component,
+                                   mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                                   0, 1, 0, 0, 0, 0, 0, 0)
+        t0 = time.time()
+        while time.time() - t0 < 4:
+            conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            m = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+            if m and m.base_mode & 128:
                 return True
         time.sleep(1)
     return False
 
 
-def takeoff_and_wait(conn, alt, state, timeout=60):
-    conn.mav.command_long_send(
-        conn.target_system, conn.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-        0, 0, 0, 0, 0, 0, 0, alt)
-    start = time.time()
-    retried = False
-    while time.time() - start < timeout and not state.shutdown:
-        conn.mav.heartbeat_send(
-            mavutil.mavlink.MAV_TYPE_GCS,
-            mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
-        gps = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
-        if gps:
-            cur_alt = gps.relative_alt / 1e3
-            if cur_alt >= alt * 0.85:
-                return True
-            if cur_alt < 1.0 and time.time() - start > 15 and not retried:
-                retried = True
-                conn.mav.command_long_send(
-                    conn.target_system, conn.target_component,
-                    mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-                    0, 0, 0, 0, 0, 0, 0, alt)
+def mav_takeoff(conn, alt, state, timeout=60):
+    conn.mav.command_long_send(conn.target_system, conn.target_component,
+                               mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                               0, 0, 0, 0, 0, 0, 0, alt)
+    t0 = time.time()
+    while time.time() - t0 < timeout and not state.shutdown:
+        conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS,
+                                mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        m = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
+        if m and m.relative_alt / 1e3 >= alt * 0.8:
+            return True
         time.sleep(0.5)
     return False
 
 
-def get_position(conn):
-    gps = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
-    if not gps:
-        return None
-    return (gps.lat / 1e7, gps.lon / 1e7, gps.relative_alt / 1e3)
+def mav_goto(conn, lat, lon, alt):
+    conn.mav.set_position_target_global_int_send(
+        0, conn.target_system, conn.target_component,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        0b0000111111111000,
+        int(lat * 1e7), int(lon * 1e7), alt,
+        0, 0, 0, 0, 0, 0, 0, 0)
 
 
-def get_telemetry(conn):
-    """Get position + attitude. Returns (lat, lon, alt, heading_deg, pitch_deg) or None."""
-    gps = None
-    att = None
-    deadline = time.time() + 2
-    while time.time() < deadline:
-        msg = conn.recv_match(blocking=True, timeout=0.5)
-        if msg is None:
+def mav_land(conn):
+    conn.mav.command_long_send(conn.target_system, conn.target_component,
+                               mavutil.mavlink.MAV_CMD_NAV_LAND,
+                               0, 0, 0, 0, 0, 0, 0, 0)
+
+
+def mav_read(conn):
+    """Read GPS + attitude in one pass. Returns (lat, lon, alt, hdg, pitch) or None."""
+    gps = att = None
+    t0 = time.time()
+    while time.time() - t0 < 1.5:
+        m = conn.recv_match(blocking=True, timeout=0.3)
+        if m is None:
             continue
-        t = msg.get_type()
+        t = m.get_type()
         if t == "GLOBAL_POSITION_INT":
-            gps = msg
+            gps = m
         elif t == "ATTITUDE":
-            att = msg
-        if gps and att:
+            att = m
+        if gps:
             break
     if not gps:
         return None
     lat = gps.lat / 1e7
     lon = gps.lon / 1e7
     alt = gps.relative_alt / 1e3
-    heading = gps.hdg / 100.0
+    hdg = gps.hdg / 100.0
     pitch = 0.0
     if att:
-        heading = math.degrees(att.yaw) % 360
+        hdg = math.degrees(att.yaw) % 360
         pitch = math.degrees(att.pitch)
-    return (lat, lon, alt, heading, pitch)
+    return lat, lon, alt, hdg, pitch
+
+# ---------------------------------------------------------------------------
+# Waypoint circle
+# ---------------------------------------------------------------------------
+
+def make_circle(lat, lon, radius_m, n):
+    wps = []
+    for i in range(n):
+        a = 2 * math.pi * i / n
+        dlat = radius_m * math.cos(a) / 111320
+        dlon = radius_m * math.sin(a) / (111320 * math.cos(math.radians(lat)))
+        wps.append((lat + dlat, lon + dlon))
+    return wps
 
 
-def send_goto(conn, lat, lon, alt):
-    conn.mav.set_position_target_global_int_send(
-        0, conn.target_system, conn.target_component,
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
-        0b0000111111111000,
-        int(lat * 1e7), int(lon * 1e7), alt,
-        0, 0, 0,
-        0, 0, 0,
-        0, 0)
-
-
-def land(conn):
-    conn.mav.command_long_send(
-        conn.target_system, conn.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_LAND,
-        0, 0, 0, 0, 0, 0, 0, 0)
-
-
-def dist_between(lat1, lon1, lat2, lon2):
+def dist_m(lat1, lon1, lat2, lon2):
     dlat = (lat2 - lat1) * 111320
     dlon = (lon2 - lon1) * 111320 * math.cos(math.radians(lat1))
     return math.sqrt(dlat ** 2 + dlon ** 2)
 
 # ---------------------------------------------------------------------------
-# Waypoint generation
+# Detection scanner — runs YOLO in a dedicated thread, never blocks flight
 # ---------------------------------------------------------------------------
 
-def generate_circle_waypoints(center_lat, center_lon, radius_m, n):
-    waypoints = []
-    for i in range(n):
-        bearing = 2 * math.pi * i / n
-        dlat = radius_m * math.cos(bearing) / 111320
-        dlon = radius_m * math.sin(bearing) / (111320 * math.cos(math.radians(center_lat)))
-        waypoints.append((center_lat + dlat, center_lon + dlon))
-    return waypoints
+def run_scanner(name, cam_url, cam_info, state):
+    """Grab frames from `cam_url`, run YOLO, update state if boat found."""
+    cam = Cam(cam_url)
+    time.sleep(5)  # let camera start
+    log(name + "-scan", "scanning started")
+    while not state.shutdown:
+        if state.boat_found:
+            # Keep re-estimating position from this camera
+            frame = cam.grab()
+            if frame is not None:
+                with state.lock:
+                    telem = state.positions.get(name), state.attitudes.get(name)
+                pos, att = telem
+                if pos and att:
+                    dets = yolo_detect(frame)
+                    if dets:
+                        conf, x, y, w, h = dets[0]
+                        coords = bbox_to_gps(x + w/2, y + h/2,
+                                             pos[0], pos[1], pos[2],
+                                             att[0], att[1], cam_info)
+                        if coords:
+                            with state.lock:
+                                state.boat_lat = coords[0]
+                                state.boat_lon = coords[1]
+            time.sleep(2)
+            continue
+
+        frame = cam.grab()
+        if frame is None:
+            time.sleep(1)
+            continue
+
+        dets = yolo_detect(frame)
+        if dets:
+            conf, x, y, w, h = dets[0]
+            with state.lock:
+                telem = state.positions.get(name), state.attitudes.get(name)
+            pos, att = telem
+            if pos and att:
+                coords = bbox_to_gps(x + w/2, y + h/2,
+                                     pos[0], pos[1], pos[2],
+                                     att[0], att[1], cam_info)
+                if coords:
+                    log(name + "-scan", f"BOAT DETECTED! conf={conf:.2f} → ({coords[0]:.6f}, {coords[1]:.6f})")
+                    with state.lock:
+                        state.boat_found = True
+                        state.boat_lat = coords[0]
+                        state.boat_lon = coords[1]
+
+        time.sleep(1.5)
 
 # ---------------------------------------------------------------------------
-# Asset threads
+# Drone flight threads
 # ---------------------------------------------------------------------------
 
-def run_quadcopter(state, detector):
+def fly_copter(state):
     name = "quadcopter"
     info = ASSETS[name]
+    cam_info = DRONE_CAMS[name]
+    conn = None
     try:
         log(name, "connecting...")
-        conn = connect(name, wait_ekf=True)
+        conn = mav_connect(name, info["udp"], wait_ekf=True)
 
-        log(name, "setting GUIDED mode")
-        set_mode(conn, info["guided_mode"])
+        log(name, "GUIDED mode")
+        mav_set_mode(conn, info["guided_mode"])
 
         log(name, "arming")
-        if not arm(conn):
-            log(name, "ARM FAILED")
-            return
-        time.sleep(1)
+        if not mav_arm(conn, name):
+            log(name, "ARM FAILED"); return
 
-        log(name, f"taking off to {QUAD_PATROL_ALT}m")
-        if not takeoff_and_wait(conn, QUAD_PATROL_ALT, state):
-            log(name, "takeoff timed out, continuing anyway")
+        log(name, f"takeoff → {QUAD_ALT}m")
+        if mav_takeoff(conn, QUAD_ALT, state):
+            log(name, "airborne")
         else:
-            log(name, "reached altitude")
+            log(name, "takeoff slow, continuing")
 
-        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
+        threading.Thread(target=mav_heartbeat, args=(conn, state), daemon=True).start()
+        threading.Thread(target=run_scanner, args=(name, cam_info["cam"], cam_info, state), daemon=True).start()
 
-        waypoints = generate_circle_waypoints(
-            *SITE_CENTER, QUAD_PATROL_RADIUS_M, QUAD_PATROL_WAYPOINTS)
-        wp_idx = 0
-
-        log(name, f"patrol started — {len(waypoints)} waypoints, {QUAD_PATROL_RADIUS_M}m radius")
-
-        cam = CameraStream(CAMERA_URLS[name])
-        last_detect = 0
+        wps = make_circle(*SITE_CENTER, QUAD_RADIUS, N_WAYPOINTS)
+        idx = 0
+        log(name, f"patrol — {len(wps)} waypoints, {QUAD_RADIUS}m radius")
 
         while not state.shutdown:
+            # If boat found, fly toward it
             if state.boat_found:
-                log(name, "boat found — flying to boat position")
-                while state.boat_found and not state.shutdown:
+                with state.lock:
+                    blat, blon = state.boat_lat, state.boat_lon
+                mav_goto(conn, blat, blon, QUAD_ALT)
+                t = mav_read(conn)
+                if t:
                     with state.lock:
-                        blat, blon = state.boat_lat, state.boat_lon
-                    if blat != 0.0 and blon != 0.0:
-                        send_goto(conn, blat, blon, QUAD_PATROL_ALT)
-                    telem = get_telemetry(conn)
-                    if telem:
-                        with state.lock:
-                            state.asset_positions[name] = telem[:3]
-                            state.asset_attitudes[name] = telem[3:]
-                    time.sleep(1.5)
+                        state.positions[name] = t[:3]
+                        state.attitudes[name] = t[3:]
+                time.sleep(1)
                 continue
 
-            # AI detection while patrolling
-            wlat, wlon = waypoints[wp_idx]
-            send_goto(conn, wlat, wlon, QUAD_PATROL_ALT)
+            # Patrol
+            wlat, wlon = wps[idx]
+            mav_goto(conn, wlat, wlon, QUAD_ALT)
 
-            while not state.shutdown and not state.boat_found:
-                telem = get_telemetry(conn)
-                if not telem:
-                    time.sleep(0.5)
-                    continue
-                lat, lon, alt, hdg, pitch = telem
-                with state.lock:
-                    state.asset_positions[name] = (lat, lon, alt)
-                    state.asset_attitudes[name] = (hdg, pitch)
-
-                if time.time() - last_detect > DETECTION_INTERVAL:
-                    frame = cam.latest()
-                    if frame is not None and detector.model is not None:
-                        result = detector.detect_and_locate(frame, lat, lon, alt, hdg, pitch, name)
-                        if result:
-                            conf, blat, blon = result
-                            log(name, f"BOAT DETECTED! conf={conf:.2f} → ({blat:.6f}, {blon:.6f})")
-                            with state.lock:
-                                state.boat_found = True
-                                state.boat_lat = blat
-                                state.boat_lon = blon
-                            break
-                        last_detect = time.time()
-
-                d = dist_between(lat, lon, wlat, wlon)
-                if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
+            arrived = False
+            for _ in range(30):  # max 30s per waypoint
+                if state.shutdown or state.boat_found:
                     break
+                t = mav_read(conn)
+                if t:
+                    with state.lock:
+                        state.positions[name] = t[:3]
+                        state.attitudes[name] = t[3:]
+                    if dist_m(t[0], t[1], wlat, wlon) < ARRIVAL_M:
+                        arrived = True
+                        break
                 time.sleep(1)
 
-            wp_idx = (wp_idx + 1) % len(waypoints)
+            idx = (idx + 1) % len(wps)
 
     except Exception as e:
         log(name, f"error: {e}")
     finally:
-        try:
+        if conn:
             log(name, "landing")
-            land(conn)
-        except Exception:
-            pass
+            mav_land(conn)
 
 
-def run_fixed_wing(state, detector):
+def fly_plane(state):
     name = "fixed-wing"
     info = ASSETS[name]
+    cam_info = DRONE_CAMS[name]
+    conn = None
     try:
         log(name, "connecting...")
-        conn = connect(name, wait_ekf=True)
+        conn = mav_connect(name, info["udp"], wait_ekf=True)
 
-        log(name, "setting TAKEOFF mode and arming")
-        set_mode(conn, 13)
-        if not arm(conn):
-            log(name, "ARM FAILED")
-            return
-        log(name, f"armed — sending takeoff to {PLANE_PATROL_ALT}m")
-        conn.mav.command_long_send(
-            conn.target_system, conn.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
-            0, 0, 0, 0, 0, 0, 0, PLANE_PATROL_ALT)
+        # Plane: TAKEOFF mode → arm → takeoff → switch to GUIDED
+        log(name, "TAKEOFF mode")
+        mav_set_mode(conn, 13)
 
-        if not takeoff_and_wait(conn, PLANE_PATROL_ALT, state, timeout=80):
-            log(name, "takeoff timed out, continuing anyway")
+        log(name, "arming")
+        if not mav_arm(conn, name):
+            log(name, "ARM FAILED"); return
+
+        log(name, f"takeoff → {PLANE_ALT}m")
+        conn.mav.command_long_send(conn.target_system, conn.target_component,
+                                   mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+                                   0, 0, 0, 0, 0, 0, 0, PLANE_ALT)
+        if mav_takeoff(conn, PLANE_ALT, state, timeout=80):
+            log(name, "airborne")
         else:
-            log(name, "reached altitude")
+            log(name, "takeoff slow, continuing")
 
-        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
+        log(name, "GUIDED mode")
+        mav_set_mode(conn, info["guided_mode"])
 
-        log(name, "switching to GUIDED mode for patrol")
-        set_mode(conn, 15)
+        threading.Thread(target=mav_heartbeat, args=(conn, state), daemon=True).start()
+        threading.Thread(target=run_scanner, args=(name, cam_info["cam"], cam_info, state), daemon=True).start()
 
-        waypoints = generate_circle_waypoints(
-            *SITE_CENTER, PLANE_PATROL_RADIUS_M, PLANE_PATROL_WAYPOINTS)
-        wp_idx = 0
-
-        log(name, f"patrol started — {len(waypoints)} waypoints, {PLANE_PATROL_RADIUS_M}m radius")
-
-        cam = CameraStream(CAMERA_URLS[name])
-        last_detect = 0
+        wps = make_circle(*SITE_CENTER, PLANE_RADIUS, N_WAYPOINTS)
+        idx = 0
+        log(name, f"patrol — {len(wps)} waypoints, {PLANE_RADIUS}m radius")
 
         while not state.shutdown:
-            # --- Phase 3: boat found → lock on and follow ---
             if state.boat_found:
-                log(name, "BOAT FOUND — locking on, tracking from camera")
-                state.locked = True
-                while state.boat_found and not state.shutdown:
-                    with state.lock:
-                        blat, blon = state.boat_lat, state.boat_lon
-                    if blat != 0.0 and blon != 0.0:
-                        send_goto(conn, blat, blon, PLANE_PATROL_ALT)
-                    telem = get_telemetry(conn)
-                    if telem:
-                        lat, lon, alt, hdg, pitch = telem
-                        with state.lock:
-                            state.asset_positions[name] = (lat, lon, alt)
-                            state.asset_attitudes[name] = (hdg, pitch)
-                        if time.time() - last_detect > DETECTION_INTERVAL:
-                            frame = cam.latest()
-                            if frame is not None and detector.model is not None:
-                                result = detector.detect_and_locate(frame, lat, lon, alt, hdg, pitch, name)
-                                if result:
-                                    conf, new_blat, new_blon = result
-                                    with state.lock:
-                                        state.boat_lat = new_blat
-                                        state.boat_lon = new_blon
-                                last_detect = time.time()
-                    time.sleep(1.5)
-                continue
-
-            # --- Phase 2: tower detected motion → rush to that area ---
-            if state.tower1_detected or state.tower2_detected:
-                if state.tower1_detected:
-                    target = TOWER_POSITIONS["tower-1"]
-                    tname = "tower-1"
-                else:
-                    target = TOWER_POSITIONS["tower-2"]
-                    tname = "tower-2"
-
-                log(name, f"TOWER {tname} detected motion — rushing to area")
-                search_wps = generate_circle_waypoints(
-                    target[0], target[1], 400, 8)
-                search_idx = 0
-
-                while (state.tower1_detected or state.tower2_detected) \
-                        and not state.boat_found and not state.shutdown:
-                    slat, slon = search_wps[search_idx]
-                    send_goto(conn, slat, slon, PLANE_PATROL_ALT)
-
-                    while not state.shutdown and not state.boat_found:
-                        telem = get_telemetry(conn)
-                        if not telem:
-                            time.sleep(0.5)
-                            continue
-                        with state.lock:
-                            state.asset_positions[name] = telem[:3]
-                            state.asset_attitudes[name] = telem[3:]
-
-                        # Check camera while searching
-                        if time.time() - last_detect > DETECTION_INTERVAL:
-                            frame = cam.latest()
-                            if frame is not None and detector.model is not None:
-                                result = detector.detect_and_locate(frame, *telem, name)
-                                if result:
-                                    conf, blat, blon = result
-                                    log(name, f"BOAT DETECTED during search! conf={conf:.2f} → ({blat:.6f}, {blon:.6f})")
-                                    with state.lock:
-                                        state.boat_found = True
-                                        state.boat_lat = blat
-                                        state.boat_lon = blon
-                                    break
-                                last_detect = time.time()
-
-                        d = dist_between(telem[0], telem[1], slat, slon)
-                        if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
-                            break
-                        time.sleep(1)
-
-                    search_idx = (search_idx + 1) % len(search_wps)
-                continue
-
-            # --- Phase 1: patrol circle ---
-            wlat, wlon = waypoints[wp_idx]
-            send_goto(conn, wlat, wlon, PLANE_PATROL_ALT)
-
-            while not state.shutdown and not state.boat_found \
-                    and not state.tower1_detected and not state.tower2_detected:
-                telem = get_telemetry(conn)
-                if not telem:
-                    time.sleep(0.5)
-                    continue
-                lat, lon, alt, hdg, pitch = telem
                 with state.lock:
-                    state.asset_positions[name] = (lat, lon, alt)
-                    state.asset_attitudes[name] = (hdg, pitch)
+                    blat, blon = state.boat_lat, state.boat_lon
+                mav_goto(conn, blat, blon, PLANE_ALT)
+                t = mav_read(conn)
+                if t:
+                    with state.lock:
+                        state.positions[name] = t[:3]
+                        state.attitudes[name] = t[3:]
+                time.sleep(1)
+                continue
 
-                if time.time() - last_detect > DETECTION_INTERVAL:
-                    frame = cam.latest()
-                    if frame is not None and detector.model is not None:
-                        result = detector.detect_and_locate(frame, lat, lon, alt, hdg, pitch, name)
-                        if result:
-                            conf, blat, blon = result
-                            log(name, f"BOAT DETECTED on patrol! conf={conf:.2f} → ({blat:.6f}, {blon:.6f})")
-                            with state.lock:
-                                state.boat_found = True
-                                state.boat_lat = blat
-                                state.boat_lon = blon
-                            break
-                        last_detect = time.time()
+            wlat, wlon = wps[idx]
+            mav_goto(conn, wlat, wlon, PLANE_ALT)
 
-                d = dist_between(lat, lon, wlat, wlon)
-                if d < WAYPOINT_ARRIVAL_THRESHOLD_M:
+            for _ in range(30):
+                if state.shutdown or state.boat_found:
                     break
+                t = mav_read(conn)
+                if t:
+                    with state.lock:
+                        state.positions[name] = t[:3]
+                        state.attitudes[name] = t[3:]
+                    if dist_m(t[0], t[1], wlat, wlon) < ARRIVAL_M:
+                        break
                 time.sleep(1)
 
-            wp_idx = (wp_idx + 1) % len(waypoints)
+            idx = (idx + 1) % len(wps)
 
     except Exception as e:
         log(name, f"error: {e}")
     finally:
-        try:
+        if conn:
             log(name, "landing")
-            land(conn)
-        except Exception:
-            pass
+            mav_land(conn)
 
+# ---------------------------------------------------------------------------
+# Tower scanner threads (YOLO on tower cameras, no flight control)
+# ---------------------------------------------------------------------------
 
 def run_tower(name, state):
-    tower_num = 1 if name == "tower-1" else 2
+    info = TOWER_CAMS[name]
     try:
-        log(name, "connecting MAVLink...")
-        conn = connect(name)
-        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
+        log(name, "connecting...")
+        conn = mav_connect(name, info["udp"])
+        threading.Thread(target=mav_heartbeat, args=(conn, state), daemon=True).start()
 
-        log(name, "starting camera stream...")
-        cam = CameraStream(CAMERA_URLS[name])
+        cam = Cam(info["cam"])
         time.sleep(3)
-
-        log(name, "initializing motion detector (learning background ~30s)...")
-        watcher = TowerWatcher(learn_seconds=30, sensitivity=16, persist=8)
+        log(name, "scanning with YOLO")
 
         while not state.shutdown:
-            pos = get_position(conn)
-            if pos:
+            # Read tower position + attitude
+            t = mav_read(conn)
+            if t:
                 with state.lock:
-                    state.asset_positions[name] = pos
+                    state.positions[name] = t[:3]
+                    state.attitudes[name] = t[3:]
 
-            frame = cam.latest()
+            frame = cam.grab()
             if frame is not None:
-                motion = watcher.process(frame)
-                if motion:
-                    log(name, "MOTION DETECTED!")
+                dets = yolo_detect(frame)
+                if dets and not state.boat_found:
+                    conf, x, y, w, h = dets[0]
+                    log(name, f"BOAT SPOTTED by tower! conf={conf:.2f}")
+                    # Towers are static so we can't triangulate well,
+                    # but we flag it so drones know to search this area
                     with state.lock:
-                        if tower_num == 1:
-                            state.tower1_detected = True
-                        else:
-                            state.tower2_detected = True
-                elif watcher.learning and watcher.looks % 100 == 0:
-                    left = watcher.learn_time - (time.time() - watcher.started)
-                    if left > 0:
-                        log(name, f"learning background... {left:.0f}s left")
+                        state.boat_found = True
+                        # Use tower position as rough estimate
+                        state.boat_lat = t[0] if t else 0
+                        state.boat_lon = t[1] if t else 0
 
-            time.sleep(0.3)
+            time.sleep(2)
 
     except Exception as e:
         log(name, f"error: {e}")
 
-
-def run_tracker(state, detector):
-    """Continuously re-estimate boat position from the fixed-wing's camera."""
-    try:
-        conn = connect("fixed-wing")
-        threading.Thread(target=heartbeat_loop, args=(conn, state), daemon=True).start()
-        cam = CameraStream(CAMERA_URLS["fixed-wing"])
-        cam_name = "fixed-wing"
-
-        while not state.shutdown:
-            if not state.boat_found:
-                time.sleep(1)
-                continue
-
-            telem = get_telemetry(conn)
-            if not telem or telem[2] < 2:
-                time.sleep(1)
-                continue
-
-            frame = cam.latest()
-            if frame is not None and detector.model is not None:
-                result = detector.detect_and_locate(frame, *telem, cam_name)
-                if result:
-                    _, blat, blon = result
-                    with state.lock:
-                        state.boat_lat = blat
-                        state.boat_lon = blon
-                        state.locked = True
-            time.sleep(DETECTION_INTERVAL)
-
-    except Exception as e:
-        log("tracker", f"error: {e}")
-
 # ---------------------------------------------------------------------------
-# Logging + status
+# Status printer
 # ---------------------------------------------------------------------------
 
-_log_lock = threading.Lock()
-
-def log(source, msg):
-    with _log_lock:
-        t = time.strftime("%H:%M:%S")
-        print(f"[{t}] [{source:12s}] {msg}")
-
-
-def status_printer(state):
+def status_loop(state):
     while not state.shutdown:
         time.sleep(10)
         with state.lock:
-            positions = dict(state.asset_positions)
+            pos = dict(state.positions)
         lines = []
-        for name in ["quadcopter", "fixed-wing", "tower-1", "tower-2"]:
-            pos = positions.get(name)
-            if pos:
-                lines.append(f"  {name:12s}  ({pos[0]:.5f}, {pos[1]:.5f})  alt={pos[2]:5.1f}m")
+        for n in ["quadcopter", "fixed-wing", "tower-1", "tower-2"]:
+            p = pos.get(n)
+            if p:
+                lines.append(f"  {n:12s}  ({p[0]:.5f}, {p[1]:.5f})  alt={p[2]:5.1f}m")
             else:
-                lines.append(f"  {name:12s}  no data")
+                lines.append(f"  {n:12s}  no data")
 
         flags = []
-        if state.tower1_detected:
-            flags.append("tower-1:MOTION")
-        if state.tower2_detected:
-            flags.append("tower-2:MOTION")
         if state.boat_found:
             flags.append(f"BOAT({state.boat_lat:.5f},{state.boat_lon:.5f})")
-        if state.locked:
-            flags.append("LOCKED")
-
         with _log_lock:
             print(f"\n[{time.strftime('%H:%M:%S')}] --- STATUS ---")
             for l in lines:
                 print(l)
             if flags:
-                print(f"  flags: {', '.join(flags)}")
+                print(f"  {', '.join(flags)}")
             print()
 
 # ---------------------------------------------------------------------------
@@ -836,32 +593,26 @@ def main():
     print("ARCTIC SIM-8 — COORDINATED MISSION")
     print("=" * 60)
     print()
-    print("Assets: quadcopter, fixed-wing, tower-1, tower-2")
-    print("AI: YOLO boat detection + tower motion detection")
-    print("Ctrl+C to land all drones and exit")
-    print()
+    print("Ctrl+C to land drones and exit\n")
 
-    state = SharedState()
-    detector = BoatDetector(MODEL_PATH, conf=MODEL_CONF)
+    get_detector()  # preload model
 
+    state = State()
     threads = [
-        threading.Thread(target=run_quadcopter, args=(state, detector), name="quadcopter"),
-        threading.Thread(target=run_fixed_wing, args=(state, detector), name="fixed-wing"),
-        threading.Thread(target=run_tower, args=("tower-1", state), name="tower-1"),
-        threading.Thread(target=run_tower, args=("tower-2", state), name="tower-2"),
-        threading.Thread(target=run_tracker, args=(state, detector), name="tracker"),
-        threading.Thread(target=status_printer, args=(state,), name="status"),
+        threading.Thread(target=fly_copter, args=(state,), daemon=True),
+        threading.Thread(target=fly_plane, args=(state,), daemon=True),
+        threading.Thread(target=run_tower, args=("tower-1", state), daemon=True),
+        threading.Thread(target=run_tower, args=("tower-2", state), daemon=True),
+        threading.Thread(target=status_loop, args=(state,), daemon=True),
     ]
-
     for t in threads:
-        t.daemon = True
         t.start()
 
     try:
         while True:
             time.sleep(0.5)
     except KeyboardInterrupt:
-        print("\n\nShutting down — landing drones...")
+        print("\n\nLanding drones...")
         state.shutdown = True
         for t in threads:
             t.join(timeout=10)
