@@ -118,7 +118,7 @@ voice.py
 
 ## Team
 
-- **Savir Singh** — University of Toronto CS + Math '29
+- **Savir Singh**
 - **Émilien Lavallée**
 - **Karan Gupta**
-- **Helen**
+- **Helen Huang**
