@@ -17,6 +17,7 @@ import math
 import time
 import sys
 import os
+import urllib.request
 import cv2
 import numpy as np
 
@@ -73,6 +74,27 @@ class State:
         self.shutdown = False
         self.positions = {}   # name → (lat, lon, alt)
         self.attitudes = {}   # name → (heading_deg, pitch_deg)
+
+
+def mark_boat_found(state, pos):
+    """Record the first detection and notify the headset viewer once."""
+    with state.lock:
+        first = not state.boat_found
+        state.boat_found = True
+        state.boat_lat, state.boat_lon = pos
+    if not first:
+        return False
+    request = urllib.request.Request(
+        f"http://{SIM_HOST}:8090/api/mission-event",
+        data=b'{"type":"boat_detected"}',
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=0.5):
+            pass
+    except OSError:
+        pass
+    return True
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -356,13 +378,8 @@ def run_scanner(name, cam_url, cam_info, state):
             coords = bbox_to_gps(x + w/2, y + h/2,
                                  pos[0], pos[1], pos[2],
                                  att[0], att[1], cam_info)
-            if coords:
-                with state.lock:
-                    if not state.boat_found:
-                        log(name + "-scan", f"BOAT DETECTED! conf={conf:.2f} → ({coords[0]:.6f}, {coords[1]:.6f})")
-                        state.boat_found = True
-                    state.boat_lat = coords[0]
-                    state.boat_lon = coords[1]
+            if coords and mark_boat_found(state, coords):
+                log(name + "-scan", f"BOAT DETECTED! conf={conf:.2f} → ({coords[0]:.6f}, {coords[1]:.6f})")
 
         time.sleep(1.5)
 

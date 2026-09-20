@@ -43,7 +43,9 @@ The script builds and starts the local simulator, forwards its browser and
 camera ports to Quest, opens `http://localhost:8080` there, then runs the
 mission against the local simulator. Choose a vehicle for VR or **Tabletop map
 (AR)** for a passthrough terrain map with live asset pointers. Ctrl+C stops the
-mission and resets the local simulator.
+mission and resets the local simulator. The first confirmed boat detection
+briefly appears in either Quest view; the vessel remains a map marker rather
+than a camera destination.
 
 ### Check asset status
 
