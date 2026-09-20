@@ -387,17 +387,30 @@ def get_position(conn):
 
 def get_telemetry(conn):
     """Get position + attitude. Returns (lat, lon, alt, heading_deg, pitch_deg) or None."""
-    gps = conn.recv_match(type="GLOBAL_POSITION_INT", blocking=True, timeout=2)
+    gps = None
+    att = None
+    deadline = time.time() + 2
+    while time.time() < deadline:
+        msg = conn.recv_match(blocking=True, timeout=0.5)
+        if msg is None:
+            continue
+        t = msg.get_type()
+        if t == "GLOBAL_POSITION_INT":
+            gps = msg
+        elif t == "ATTITUDE":
+            att = msg
+        if gps and att:
+            break
     if not gps:
         return None
-    att = conn.recv_match(type="ATTITUDE", blocking=True, timeout=1)
     lat = gps.lat / 1e7
     lon = gps.lon / 1e7
     alt = gps.relative_alt / 1e3
     heading = gps.hdg / 100.0
-    pitch = math.degrees(att.pitch) if att else 0.0
+    pitch = 0.0
     if att:
         heading = math.degrees(att.yaw) % 360
+        pitch = math.degrees(att.pitch)
     return (lat, lon, alt, heading, pitch)
 
 
