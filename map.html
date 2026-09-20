@@ -43,25 +43,19 @@
       <div id="asset-list"></div>
     </div>
     <div class="section">
-      <h2>Target Vessel</h2>
-      <div class="entry"><span class="label">Lat</span><span class="value" id="v-lat" style="color:#ffcc00">--</span></div>
-      <div class="entry"><span class="label">Lon</span><span class="value" id="v-lon" style="color:#ffcc00">--</span></div>
-    </div>
-    <div class="section">
       <h2>Legend</h2>
       <div class="legend">
         <span><span class="dot" style="background:#57d38c"></span> Drone</span>
         <span><span class="dot" style="background:#5bc8e0"></span> Tower</span>
         <span><span class="dot" style="background:#ff6b4a"></span> Boat est.</span>
-        <span><span class="dot" style="background:#ffcc00"></span> Vessel</span>
       </div>
     </div>
   </div>
 </div>
 <script>
-const SIM_HOST = '10.99.7.1';
-const WS_URL = 'ws://' + SIM_HOST + ':8080';
-const API_URL = 'http://' + SIM_HOST + ':8090';
+// ?sim=local points the map at your own docker compose sim; the default is the shared one.
+const SIM_LOCAL = new URLSearchParams(location.search).get('sim') === 'local';
+const SIM_HOST = SIM_LOCAL ? 'localhost' : '10.99.7.1';
 
 const SITE = {
   bounds3413: {xmin:-1505608.044159686,ymin:-1271830.812646156,xmax:-1499139.421867714,ymax:-1265362.190354184},
@@ -108,8 +102,11 @@ function worldToLatLon(wx, wy) {
 const KNOWN_POSITIONS = {
   'quadcopter': {lat: 71.995807, lon: -94.839300, type: 'drone'},
   'fixed-wing': {lat: 71.998195, lon: -94.841967, type: 'drone'},
-  'tower-1':    {lat: 71.980671, lon: -94.853711, type: 'tower'},
-  'tower-2':    {lat: 72.011778, lon: -94.804721, type: 'tower'},
+  // the local sim places its towers from its own .env, elsewhere than the shared sim does
+  'tower-1':    SIM_LOCAL ? {lat: 71.988228, lon: -94.779461, type: 'tower'}
+                          : {lat: 71.980671, lon: -94.853711, type: 'tower'},
+  'tower-2':    SIM_LOCAL ? {lat: 71.995542, lon: -94.889408, type: 'tower'}
+                          : {lat: 72.011778, lon: -94.804721, type: 'tower'},
 };
 
 // Canvas
@@ -133,7 +130,6 @@ function w2s(wx, wy) { return [ox + wx * sc, oy - wy * sc]; }
 // State
 const assets = {};
 let boatEstimate = null;
-let vessel = null;
 
 // Seed assets from known positions
 for (const [name, info] of Object.entries(KNOWN_POSITIONS)) {
@@ -187,14 +183,6 @@ function draw() {
     drawDot(bx, by, pulse, '#ff6b4a', 'BOAT EST');
   }
 
-  // Vessel
-  if (vessel) {
-    const [vx, vy] = w2s(vessel.wx, vessel.wy);
-    ctx.beginPath(); ctx.arc(vx, vy, 14, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(255,204,0,0.12)'; ctx.fill();
-    drawDot(vx, vy, 6, '#ffcc00', 'VESSEL');
-  }
-
   // Assets
   for (const [name, a] of Object.entries(assets)) {
     if (a.wx === undefined) continue;
@@ -207,66 +195,6 @@ function draw() {
   requestAnimationFrame(draw);
 }
 
-// WebSocket for real-time poses (quadcopter + vessel move)
-let wsConn;
-function connectWS() {
-  const el = document.getElementById('status');
-  wsConn = new WebSocket(WS_URL);
-  wsConn.onopen = () => { el.textContent = 'connected'; el.className = ''; };
-  wsConn.onclose = () => { el.textContent = 'disconnected'; el.className = 'off'; setTimeout(connectWS, 3000); };
-  wsConn.onerror = () => {};
-  wsConn.onmessage = (ev) => {
-    try {
-      const d = JSON.parse(ev.data);
-      if (d.topic !== '~/pose/info' || !d.msg) return;
-      const name = d.msg.name;
-      const top = name.split('::')[0];
-      const pos = d.msg.position;
-      if (!pos || name.includes('::')) return;
-
-      if (top === 'target_vessel') {
-        const [lat, lon] = worldToLatLon(pos.x, pos.y);
-        vessel = { wx: pos.x, wy: pos.y, wz: pos.z, lat, lon };
-        document.getElementById('v-lat').textContent = lat.toFixed(6);
-        document.getElementById('v-lon').textContent = lon.toFixed(6);
-      }
-
-      if (top in assets) {
-        const [lat, lon] = worldToLatLon(pos.x, pos.y);
-        Object.assign(assets[top], { wx: pos.x, wy: pos.y, wz: pos.z, lat, lon });
-      }
-    } catch(e) {}
-  };
-}
-
-function updateEstimate() {
-  if (!vessel) return;
-  const estimates = [];
-  for (const [name, a] of Object.entries(assets)) {
-    if (!a.wz || a.wz < 1) continue;
-    const dx = vessel.wx - a.wx, dy = vessel.wy - a.wy;
-    const hDist = Math.sqrt(dx*dx + dy*dy);
-    const elev = Math.atan2(a.wz, hDist) * R2D;
-    if (elev <= 0) continue;
-    const heading = Math.atan2(dx, dy);
-    const estDist = a.wz / Math.tan(elev * D2R);
-    const ewx = a.wx + Math.sin(heading) * estDist;
-    const ewy = a.wy + Math.cos(heading) * estDist;
-    estimates.push({ wx: ewx, wy: ewy });
-  }
-  if (estimates.length > 0) {
-    const avgWx = estimates.reduce((s,e) => s + e.wx, 0) / estimates.length;
-    const avgWy = estimates.reduce((s,e) => s + e.wy, 0) / estimates.length;
-    const [lat, lon] = worldToLatLon(avgWx, avgWy);
-    boatEstimate = { wx: avgWx, wy: avgWy, lat, lon };
-    document.getElementById('boat-lat').textContent = lat.toFixed(6);
-    document.getElementById('boat-lon').textContent = lon.toFixed(6);
-    const errDx = avgWx - vessel.wx, errDy = avgWy - vessel.wy;
-    document.getElementById('boat-dist').textContent = Math.sqrt(errDx*errDx + errDy*errDy).toFixed(1) + 'm error';
-  }
-  updateAssetList();
-}
-
 function updateAssetList() {
   const el = document.getElementById('asset-list');
   let html = '';
@@ -277,8 +205,8 @@ function updateAssetList() {
   el.innerHTML = html;
 }
 
-setInterval(updateEstimate, 1000);
-connectWS();
+document.getElementById('status').textContent = 'no live feed';
+updateAssetList();
 draw();
 </script>
 </body>

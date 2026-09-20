@@ -5,6 +5,7 @@ learned as background and only moving objects, like a vessel under way, stand ou
 
     python3 tower_watch.py --tower 2 --pan 118 --tilt -4.4     # aim, learn, then watch
     python3 tower_watch.py --tower 2                            # watch wherever it points now
+    python3 tower_watch.py --tower 2 --sim local                # against your own docker compose sim
 
 What it does:
   1. (--pan/--tilt) aims the tower over MAVLink. The tracker is in MANUAL mode, where RC
@@ -29,6 +30,8 @@ import time
 
 import cv2
 import numpy as np
+
+import sim_config
 
 try:
     from pymavlink import mavutil
@@ -86,11 +89,13 @@ class Camera:
 class Tower:
     """MAVLink link to a camera tower's AntennaTracker: reads attitude, holds an aim."""
 
-    def __init__(self, urls):
+    def __init__(self, urls=(), conn=None):
+        """Connect to the first of `urls` that answers, or take over an open `conn` (which this
+        object then owns: nothing else may read from it)."""
         if mavutil is None:
             sys.exit("pymavlink is not installed: pip install pymavlink")
-        self.m = None
-        for url in urls:
+        self.m = conn
+        for url in urls if conn is None else ():
             m = mavutil.mavlink_connection(url)
             m.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
             if m.wait_heartbeat(timeout=6):
@@ -99,6 +104,7 @@ class Tower:
         if self.m is None:
             sys.exit(f"no heartbeat from the tower on {urls}; try ./mavcheck tower-N in the sim folder")
         self.yaw = self.pitch = None
+        self.pos = None                            # (lat, lon, height above spawn) once reported
         self.pan_us = self.tilt_us = None          # None = not overriding
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -106,8 +112,11 @@ class Tower:
         last_hb = last_rc = 0.0
         while True:
             msg = self.m.recv_match(blocking=True, timeout=0.1)
-            if msg is not None and msg.get_type() == "ATTITUDE":
+            kind = msg.get_type() if msg is not None else None
+            if kind == "ATTITUDE":
                 self.yaw, self.pitch = math.degrees(msg.yaw), math.degrees(msg.pitch)
+            elif kind == "GLOBAL_POSITION_INT":
+                self.pos = (msg.lat / 1e7, msg.lon / 1e7, msg.relative_alt / 1e3)
             now = time.time()
             if now - last_hb > 1:
                 self.m.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_GCS, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
@@ -274,6 +283,7 @@ def main():
     ap.add_argument("--pan", type=float, help="compass bearing to aim at, degrees")
     ap.add_argument("--tilt", type=float, help="degrees above horizontal (negative = look down)")
     ap.add_argument("--saved", action="store_true", help="use the aim saved by tower_aim.py")
+    sim_config.add_argument(ap)
     ap.add_argument("--connect", help="MAVLink endpoint (default: the tower's GCS port)")
     ap.add_argument("--camera", help="camera stream URL (default: the tower's port)")
     ap.add_argument("--learn", type=float, default=30, help="seconds to learn the background")
@@ -285,6 +295,7 @@ def main():
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0 = until Ctrl-C)")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "tower_output"))
     args = ap.parse_args()
+    sim_config.configure(args)
 
     saved_us = None
     if args.saved:
@@ -295,7 +306,7 @@ def main():
         args.pan, args.tilt = saved["pan"], saved["tilt"]
         saved_us = (saved["pan_us"], saved["tilt_us"]) if "pan_us" in saved else None
     ports, cam_port = TOWERS[args.tower]
-    urls = [args.connect] if args.connect else [f"udpout:localhost:{p}" for p in ports]
+    urls = [args.connect] if args.connect else [f"udpout:{sim_config.host()}:{p}" for p in ports]
     tower = Tower(urls)
     if (args.pan is None) != (args.tilt is None):
         sys.exit("give --pan and --tilt together, or neither")
@@ -308,7 +319,7 @@ def main():
         print(f"aiming tower {args.tower} at bearing {args.pan:.1f}, tilt {args.tilt:+.1f} ...")
         yaw, pitch = tower.aim(args.pan, args.tilt)
         print(f"  now at bearing {yaw % 360:.1f}, tilt {pitch:+.1f}")
-    camera = Camera(args.camera or f"http://localhost:{cam_port}/stream")
+    camera = Camera(args.camera or f"http://{sim_config.host()}:{cam_port}/stream")
 
     watcher = Watcher(args.tower, args.out, learn=args.learn, sensitivity=args.sensitivity, rate=args.rate,
                       min_area=args.min_area, max_area=args.max_area, persist=args.persist)

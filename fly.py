@@ -8,25 +8,23 @@ Usage:
     python3 fly.py goto quadcopter 71.990 -94.830 80
     python3 fly.py status
     python3 fly.py land quadcopter
+
+Add --sim local (or set SIM_TARGET=local) to use your own docker compose sim instead of the
+shared one over WireGuard, e.g. python3 fly.py --sim local status
 """
 
 from pymavlink import mavutil
+import argparse
+import sim_config
 import time
 import math
 import sys
 
-ASSETS = {
-    "quadcopter": {"host": "10.99.7.1", "udp": 14550, "type": "copter"},
-    "fixed-wing": {"host": "10.99.7.1", "udp": 14560, "type": "plane"},
-    "tower-1":    {"host": "10.99.7.1", "udp": 14580, "type": "tower"},
-    "tower-2":    {"host": "10.99.7.1", "udp": 14590, "type": "tower"},
-}
+ASSETS = sim_config.ASSETS
 
 
 def connect(name):
-    info = ASSETS[name]
-    addr = f"udpout:{info['host']}:{info['udp']}"
-    conn = mavutil.mavlink_connection(addr, source_system=255)
+    conn = mavutil.mavlink_connection(sim_config.mavlink_url(name), source_system=255)
     for _ in range(5):
         conn.mav.heartbeat_send(
             mavutil.mavlink.MAV_TYPE_GCS,
@@ -161,6 +159,11 @@ def usage():
 
 
 if __name__ == "__main__":
+    sim_parser = argparse.ArgumentParser(add_help=False)
+    sim_config.add_argument(sim_parser)
+    sim_args, sys.argv[1:] = sim_parser.parse_known_args()
+    sim_config.configure(sim_args)
+
     if len(sys.argv) < 2:
         usage()
 

@@ -15,6 +15,7 @@ a lat/lon offset from the drone.
 Usage:
     python3 tracker.py              # run with test coordinates
     python3 tracker.py --live       # connect to SIM MAVLink (when available)
+    python3 tracker.py --live --sim local   # your own docker compose sim (or SIM_TARGET=local)
 """
 
 import math
@@ -22,16 +23,13 @@ import argparse
 import time
 import json
 
+import sim_config
+
 # Earth radius in metres (WGS-84 mean)
 EARTH_RADIUS = 6_371_000
 
 # SIM asset connection info (UDP ports — SITL only streams over UDP)
-ASSETS = {
-    "quadcopter": {"host": "10.99.7.1", "udp": 14550, "type": "copter"},
-    "fixed-wing": {"host": "10.99.7.1", "udp": 14560, "type": "plane"},
-    "tower-1":    {"host": "10.99.7.1", "udp": 14580, "type": "tower"},
-    "tower-2":    {"host": "10.99.7.1", "udp": 14590, "type": "tower"},
-}
+ASSETS = sim_config.ASSETS
 
 
 def estimate_boat_position(drone_lat, drone_lon, drone_alt,
@@ -62,6 +60,59 @@ def estimate_boat_position(drone_lat, drone_lon, drone_alt,
     )
 
     return boat_lat, boat_lon, horizontal_dist
+
+
+def _rx(v, a):
+    c, s = math.cos(a), math.sin(a)
+    return (v[0], c * v[1] - s * v[2], s * v[1] + c * v[2])
+
+
+def _ry(v, a):
+    c, s = math.cos(a), math.sin(a)
+    return (c * v[0] + s * v[2], v[1], -s * v[0] + c * v[2])
+
+
+def _rz(v, a):
+    c, s = math.cos(a), math.sin(a)
+    return (c * v[0] - s * v[1], s * v[0] + c * v[1], v[2])
+
+
+def estimate_from_pixel(drone_lat, drone_lon, height_m, yaw_deg, pitch_deg, roll_deg,
+                        px, py, img_w, img_h, hfov_rad, tilt_down_deg):
+    """
+    Estimate a target's GPS position from where it appears in a drone frame.
+
+    Casts the pixel's ray from the camera through the drone's attitude and intersects
+    it with a flat water plane. The camera is rigidly mounted looking forward, tilted
+    tilt_down_deg below the airframe's nose axis, with no roll about its optical axis.
+
+    Args:
+        height_m:   drone height above the water plane (AMSL altitude in the sim)
+        yaw_deg/pitch_deg/roll_deg: ArduPilot ATTITUDE (yaw clockwise from north,
+                    pitch + = nose up, roll + = right wing down)
+        px, py:     target pixel (origin top-left)
+        hfov_rad:   camera horizontal field of view
+        tilt_down_deg: camera downtilt relative to the airframe nose axis
+
+    Returns:
+        (lat, lon, ground_distance_m)
+
+    Raises ValueError if the ray does not reach the water (pixel at/above the horizon).
+    """
+    f = (img_w / 2) / math.tan(hfov_rad / 2)
+    # Body frame is forward / right / down.
+    ray = (1.0, (px - img_w / 2) / f, (py - img_h / 2) / f)
+    ray = _ry(ray, -math.radians(tilt_down_deg))
+    ray = _rx(ray, math.radians(roll_deg))
+    ray = _ry(ray, math.radians(pitch_deg))
+    north, east, down = _rz(ray, math.radians(yaw_deg))
+    if down <= 1e-6 or height_m <= 0:
+        raise ValueError("Ray does not reach the water")
+
+    t = height_m / down
+    dist = t * math.hypot(north, east)
+    lat, lon = offset_lat_lon(drone_lat, drone_lon, dist, math.atan2(east, north))
+    return lat, lon, dist
 
 
 def offset_lat_lon(lat, lon, distance_m, bearing_rad):
@@ -132,8 +183,8 @@ def run_live():
     print()
 
     connections = {}
-    for name, info in ASSETS.items():
-        addr = f"udpout:{info['host']}:{info['udp']}"
+    for name in ASSETS:
+        addr = sim_config.mavlink_url(name)
         print(f"Connecting to {name} at {addr}...")
         try:
             conn = mavutil.mavlink_connection(addr, source_system=255)
@@ -221,7 +272,9 @@ def run_live():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Boat position estimator for Arctic SIM-8")
     parser.add_argument("--live", action="store_true", help="Connect to SIM MAVLink")
+    sim_config.add_argument(parser)
     args = parser.parse_args()
+    sim_config.configure(args)
 
     if args.live:
         run_live()
